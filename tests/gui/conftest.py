@@ -55,6 +55,75 @@ def isolated_settings(tmp_path: Path) -> Iterator[None]:
         QSettings.setDefaultFormat(orig_default)
 
 
+class FakeAgentService:
+    """Stand-in for ``bidsmgr.agent_service``'s process-wide singleton.
+
+    The real one starts a *separate Python process* whose first act is
+    importing torch — tens of seconds and a few GB, on a machine the
+    tests do not get to choose. Since Settings → Save and the Ask AI
+    button both reach for it, leaving the real singleton in place would
+    make the suite spawn agents in the background. So the singleton is
+    swapped out for every GUI test, and this object is what a test that
+    cares about the wiring can inspect.
+
+    It has the same surface as :class:`bidsmgr.agent_service.AgentService`
+    minus the plumbing: state, detail, url, owned, start, stop,
+    is_running and wait_running.
+    """
+
+    def __init__(self) -> None:
+        self.state = "stopped"
+        self.detail = "Not running."
+        self.url = ""
+        self.owned = False
+        self.started_with: list[str] = []
+        self.stop_calls = 0
+
+    # -- the surface AgentService has --------------------------------
+    def start(self, *, python: str = "", on_ready=None) -> None:
+        self.started_with.append(python)
+        self.state = "starting"
+        self.detail = "Starting the AI agent..."
+        self.url = ""
+        self.owned = True
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self.state = "stopped"
+        self.detail = "Not running."
+        self.url = ""
+        self.owned = False
+
+    def is_running(self) -> bool:
+        return self.state == "running"
+
+    def wait_running(self, timeout: float = 60.0) -> bool:
+        return self.state == "running"
+
+    # -- what a test needs to say happened --------------------------
+    def pretend_running(self, url: str = "", owned: bool = True) -> None:
+        self.state = "running"
+        self.detail = "Running (started by BIDS-Manager)."
+        self.url = url
+        self.owned = owned
+
+    def pretend_failed(self, detail: str = "No Python found.") -> None:
+        self.state = "failed"
+        self.detail = detail
+        self.url = ""
+        self.owned = False
+
+
+@pytest.fixture(autouse=True)
+def fake_agent_service(monkeypatch) -> Iterator[FakeAgentService]:
+    """Never let a test start the real agent."""
+    from bidsmgr import agent_service as module
+
+    fake = FakeAgentService()
+    monkeypatch.setattr(module, "_SERVICE", fake)
+    yield fake
+
+
 def open_every_folder(tree) -> None:
     """Draw every row in a lazy tree, then put the folds back as they were.
 

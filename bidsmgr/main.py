@@ -18,10 +18,25 @@ The GUI is a convenience layer over the same engine.
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 from pathlib import Path
 from typing import Optional
+
+
+def _quietly(fn) -> None:
+    """Run ``fn``, logging instead of raising.
+
+    Used for best-effort work that follows a service coming up: failing
+    to apply a preference must not take the whole app down with it.
+    """
+    try:
+        fn()
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "background follow-up failed", exc_info=True,
+        )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -133,6 +148,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     # one version while being filled in against another.
     from .schema import set_active_version
     set_active_version(persisted.validate_schema_version)
+
+    # Bring the AI agent up in the background while the window is still
+    # being built, so by the time anybody can click Ask AI it is usually
+    # already serving. It is a separate process with its own interpreter
+    # (see bidsmgr.agent_service); nothing here blocks on it, and a
+    # machine that cannot run it ends up in a state Settings -> AI Agent
+    # can explain rather than failing here.
+    from . import agent_service as _agent_service
+    agent = _agent_service.service()
+    # Both: aboutToQuit covers the ordinary exit, atexit the paths that
+    # never reach the event loop. stop() is idempotent and refuses to
+    # touch a process we did not start, so the double call costs nothing.
+    app.aboutToQuit.connect(agent.stop)
+    atexit.register(agent.stop)
+    if persisted.ai_enabled:
+        from .gui.ai_explainer import push_llm_config
+
+        # Pushed only once the agent is up: our stored LLM preferences
+        # are what it should run with, not whatever its config.json says.
+        agent.start(
+            python=persisted.ai_python,
+            on_ready=lambda: _quietly(
+                lambda: push_llm_config(persisted)
+            ),
+        )
 
     theme = ThemeManager(app, font_scale=persisted.font_scale)
     theme.apply(initial_theme)

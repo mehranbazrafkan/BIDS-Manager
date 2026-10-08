@@ -93,7 +93,27 @@ KEYS = {
     # Recently opened/created project dataset roots (JSON list, most-recent
     # first), shown on the Welcome tab.
     "recent_projects": "project/recent",
+    # The bundled AI agent (``bidsmgr/ai_agent/``), reached over HTTP.
+    "ai_enabled":       "ai/enabled",        # draw the "Ask AI" button
+    "ai_base_url":      "ai/base_url",       # where the agent service lives
+    "ai_timeout":       "ai/timeout",        # seconds before /predict gives up
+    # How BIDS-Manager starts it, and what it runs when it is up. The URL
+    # is deliberately NOT one of these: the app starts the service, so it
+    # already knows where it is.
+    "ai_python":        "ai/python",         # "" = auto-detect an interpreter
+    "ai_model":         "ai/model",          # "" = whatever the agent runs
+    "ai_max_new_tokens": "ai/max_new_tokens",
+    "ai_device_map":    "ai/device_map",     # auto | cpu | cuda | mps
+    "ai_quantization":  "ai/quantization",   # none | 4bit | 8bit
+    "ai_enable_thinking": "ai/enable_thinking",
+    "ai_temperature":   "ai/temperature",    # answer variety
 }
+
+# Permitted values for the agent's LLM knobs, shared by the loader (which
+# rejects anything else before it can reach the model) and the Settings
+# combos (which must offer exactly what the loader accepts).
+AI_DEVICE_MAPS = ("auto", "cpu", "cuda", "mps")
+AI_QUANTIZATIONS = ("none", "4bit", "8bit")
 
 
 @dataclass
@@ -268,6 +288,30 @@ class AppSettings:
 
     # Recently opened/created project dataset roots (most-recent first).
     recent_projects: list = field(default_factory=list)
+
+    # The AI agent that explains findings on click. It is a SEPARATE
+    # process — because it loads a local LLM that the desktop app must
+    # not pull in on startup. BIDS-Manager starts it itself
+    # (bidsmgr.agent_service)
+    # on an interpreter that has the agent's stack; these say whether to
+    # offer the button, how to reach the service, how long to wait, and
+    # what the model should be running with once it is up.
+    ai_enabled: bool = True
+    ai_base_url: str = "http://127.0.0.1:8000"
+    ai_timeout: int = 120
+    # Interpreter used to launch the agent. "" means auto-detect: probe
+    # this app's own interpreter first, then PATH, then the Windows
+    # launcher, and take the first that can see flask/torch/transformers/
+    # laya. The venv BIDS Manager installs into normally cannot.
+    ai_python: str = ""
+    # LLM settings, pushed to the agent over PUT /config once it is up.
+    # Empty model = leave whatever the agent's own config.json says.
+    ai_model: str = ""
+    ai_max_new_tokens: int = 250
+    ai_device_map: str = "auto"        # auto | cpu | cuda | mps
+    ai_quantization: str = "none"      # none | 4bit | 8bit
+    ai_enable_thinking: bool = False
+    ai_temperature: float = 0.75       # answer variety, not "creativity"
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -513,6 +557,49 @@ class AppSettings:
         out.user_hints = _as_json_list(s.value(KEYS["user_hints"]), [])
         out.scan_exclusions = _as_json_list(s.value(KEYS["scan_exclusions"]), [])
         out.recent_projects = _as_json_list(s.value(KEYS["recent_projects"]), [])
+        out.ai_enabled = _as_bool(s.value(KEYS["ai_enabled"]), out.ai_enabled)
+        out.ai_base_url = (
+            _as_str(s.value(KEYS["ai_base_url"]), out.ai_base_url).strip()
+            or out.ai_base_url
+        )
+        out.ai_timeout = _as_int(s.value(KEYS["ai_timeout"]), out.ai_timeout)
+        # A stored 0 or a negative would make urlopen raise on construction
+        # rather than time out, which reads as a crash instead of a slow agent.
+        if out.ai_timeout < 5:
+            out.ai_timeout = 120
+        out.ai_python = _as_str(s.value(KEYS["ai_python"]), out.ai_python).strip()
+        out.ai_model = _as_str(s.value(KEYS["ai_model"]), out.ai_model).strip()
+        # The model list used to offer google/gemma-3-270m, the *base*
+        # checkpoint: no instruction tuning, no chat template, so asking it
+        # a question failed outright. The -it sibling is the same size and
+        # the one that can converse, so a choice made from the old list is
+        # corrected rather than left broken.
+        if out.ai_model == "google/gemma-3-270m":
+            out.ai_model = "google/gemma-3-270m-it"
+        out.ai_max_new_tokens = _as_int(
+            s.value(KEYS["ai_max_new_tokens"]), out.ai_max_new_tokens,
+        )
+        if not 16 <= out.ai_max_new_tokens <= 8192:
+            out.ai_max_new_tokens = 250
+        # Constrained vocabularies. A hand-edited value outside them would
+        # reach from_pretrained() and fail only once a model actually
+        # loads, which is minutes after the setting was saved.
+        device_map = _as_str(
+            s.value(KEYS["ai_device_map"]), out.ai_device_map,
+        ).strip()
+        out.ai_device_map = device_map if device_map in AI_DEVICE_MAPS else "auto"
+        quant = _as_str(
+            s.value(KEYS["ai_quantization"]), out.ai_quantization,
+        ).strip().lower()
+        out.ai_quantization = quant if quant in AI_QUANTIZATIONS else "none"
+        out.ai_enable_thinking = _as_bool(
+            s.value(KEYS["ai_enable_thinking"]), out.ai_enable_thinking,
+        )
+        out.ai_temperature = _as_float(
+            s.value(KEYS["ai_temperature"]), out.ai_temperature,
+        )
+        if not 0.0 <= out.ai_temperature <= 2.0:
+            out.ai_temperature = 0.75
         return out
 
     def save(self) -> None:
@@ -551,6 +638,8 @@ class AppSettings:
             ("validate_flag_todos",      self.validate_flag_todos),
             ("editor_show_hidden",       self.editor_show_hidden),
             ("editor_autosave",          self.editor_autosave),
+            ("ai_enabled",               self.ai_enabled),
+            ("ai_enable_thinking",       self.ai_enable_thinking),
         ):
             s.setValue(KEYS[key], "1" if val else "0")
         # Strings. Keep them OUT of the loop above: it writes "1" for anything
@@ -572,6 +661,17 @@ class AppSettings:
         s.setValue(KEYS["skipped_update_version"], self.skipped_update_version)
         s.setValue(KEYS["font_scale"], float(self.font_scale))
         s.setValue(KEYS["header_logo"], self.header_logo)
+        # AI agent service. The URL is a string and the timeout an int;
+        # both sit here with the other strings rather than in the bool
+        # loop above, which would write the URL as "1".
+        s.setValue(KEYS["ai_base_url"], self.ai_base_url)
+        s.setValue(KEYS["ai_timeout"], int(self.ai_timeout))
+        s.setValue(KEYS["ai_python"], self.ai_python)
+        s.setValue(KEYS["ai_model"], self.ai_model)
+        s.setValue(KEYS["ai_device_map"], self.ai_device_map)
+        s.setValue(KEYS["ai_quantization"], self.ai_quantization)
+        s.setValue(KEYS["ai_max_new_tokens"], int(self.ai_max_new_tokens))
+        s.setValue(KEYS["ai_temperature"], float(self.ai_temperature))
         # Scan rules as JSON blobs.
         s.setValue(KEYS["user_hints"], json.dumps(self.user_hints))
         s.setValue(KEYS["scan_exclusions"], json.dumps(self.scan_exclusions))

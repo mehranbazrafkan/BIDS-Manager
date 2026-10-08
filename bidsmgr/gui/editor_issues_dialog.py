@@ -68,6 +68,14 @@ class _FileCard(QFrame):
         super().__init__(parent)
         self.setObjectName("issue-card")
         self._path = path
+        # What the AI agent needs to place this card's findings: which
+        # file, and what kind. Built once — every message in the card
+        # asks about the same one.
+        self._ai_context: dict = {"path": str(path)}
+        if datatype:
+            self._ai_context["datatype"] = str(datatype)
+        if suffix:
+            self._ai_context["suffix"] = str(suffix)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(10, 8, 10, 8)
@@ -122,6 +130,7 @@ class _FileCard(QFrame):
                     fix_label=issue.fix_label,
                     field=issue.field,
                     schema_rule=issue.schema_rule,
+                    context=self._ai_context,
                 )
                 message.fix_requested.connect(
                     lambda field, p=self._path:

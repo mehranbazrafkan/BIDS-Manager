@@ -13,6 +13,7 @@ output with no reshaping.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -26,6 +27,8 @@ from PyQt6.QtWidgets import (
 )
 
 from .status_badge import StatusBadge
+
+log = logging.getLogger(__name__)
 
 
 class _Elided(QLabel):
@@ -120,14 +123,24 @@ class ValMessage(QFrame):
         fix_label: Optional[str] = None,
         field: Optional[str] = None,
         schema_rule: Optional[str] = None,
+        context: Optional[dict] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName(_OBJECT_NAME_BY_SEVERITY.get(severity, "val-msg"))
 
+        self._severity = severity
+        self._body_html = body_html
+        self._fix_label = fix_label
         self._schema_rule = schema_rule or ""
         self._rule_id = rule or ""
         self._field_name = field or ""
+        # What the host knows that this widget does not — which file the
+        # finding is on, what kind of file that is — folded into the AI
+        # agent's context by :meth:`_ask_ai`. Kept as data rather than a
+        # signal so the button works wherever a ValMessage is used,
+        # including inside dialogs that wire nothing up.
+        self._context = dict(context or {})
 
         # Vertical, not horizontal. The old layout put the badge in a column
         # beside everything else and the field chip out on the right, which
@@ -163,6 +176,9 @@ class ValMessage(QFrame):
                 lambda: self.fix_requested.emit(self._field_name)
             )
             head.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        ai_btn = self._ai_button()
+        if ai_btn is not None:
+            head.addWidget(ai_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(head)
 
         # Line 2: WHICH field, on its own row rather than fighting the rule
@@ -267,7 +283,68 @@ class ValMessage(QFrame):
                 lambda: self.fix_requested.emit(self._field_name)
             )
             row.addWidget(btn, 0, Qt.AlignmentFlag.AlignTop)
+        ai_btn = self._ai_button()
+        if ai_btn is not None:
+            row.addWidget(ai_btn, 0, Qt.AlignmentFlag.AlignTop)
         outer.addLayout(row)
+
+    # ------------------------------------------------------------------
+    # AI agent
+    # ------------------------------------------------------------------
+
+    def _ai_button(self) -> Optional[QPushButton]:
+        """The "Ask AI" button, or ``None`` when it has no business here.
+
+        Two reasons to withhold it. A clean file ("Entity set is
+        valid.") gets no button: one that explains why nothing is wrong
+        is a button nobody presses, and it makes the row read as if it
+        had a problem. And Settings can turn the feature off — which also
+        stops BIDS-Manager starting the agent at all, so the button never
+        dangles in front of somebody who did not ask for it.
+        """
+        if str(self._severity).lower() in ("ok", "info"):
+            return None
+        try:
+            from ..ai_explainer import ai_enabled
+        except Exception:                                # pragma: no cover
+            log.debug("AI explainer unavailable", exc_info=True)
+            return None
+        if not ai_enabled():
+            return None
+        btn = QPushButton("Ask AI")
+        btn.setObjectName("val-ai")
+        btn.setToolTip(
+            "Ask the BIDS AI agent\n\n"
+            "Sends this finding to the AI agent in bidsmgr/ai_agent and "
+            "asks for a plain-language explanation: what is wrong, why, "
+            "and how to fix it.\n\n"
+            "BIDS-Manager starts that agent for you when it opens, so "
+            "there is nothing to run by hand. If it is still starting — "
+            "the first answer loads a local model — the window waits; "
+            "if it could not start, the window says why and points at "
+            "Settings → AI Agent, where you can start it yourself."
+        )
+        btn.clicked.connect(self._ask_ai)
+        return btn
+
+    def _ask_ai(self) -> None:
+        """Hand this finding over and open the explanation window."""
+        # Deferred: ``ai_explainer`` pulls in the dialog chrome and the
+        # spinner, and neither belongs in the import path of every row
+        # the pane renders before anybody has clicked anything.
+        from ..ai_explainer import ask, build_payload
+
+        ask(
+            build_payload(
+                severity=str(self._severity),
+                message=self._body_html,
+                rule_id=self._rule_id,
+                field=self._field_name or None,
+                fix_label=self._fix_label,
+                extra=self._context,
+            ),
+            parent=self.window(),
+        )
 
     def _on_context_menu(self, pos) -> None:
         from PyQt6.QtWidgets import QMenu

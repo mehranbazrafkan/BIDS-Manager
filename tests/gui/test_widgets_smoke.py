@@ -168,12 +168,16 @@ def test_val_message_object_name_per_severity(qtbot, theme, sev: str, obj: str) 
 def test_val_message_fix_button_emits_signal(qtbot, theme) -> None:
     msg = ValMessage("warn", "RULE-2", "fix me", fix_label="Auto-fill")
     qtbot.addWidget(msg)
-    # Find the QPushButton and click it; signal should fire.
+    # By object name rather than by count: a warning row also carries
+    # the "Ask AI" button, and clicking that one fires nothing at all.
     from PyQt6.QtWidgets import QPushButton
-    btns = msg.findChildren(QPushButton)
-    assert len(btns) == 1 and btns[0].text() == "Auto-fill"
+    fix = [
+        b for b in msg.findChildren(QPushButton)
+        if b.objectName() == "val-fix"
+    ]
+    assert len(fix) == 1 and fix[0].text() == "Auto-fill"
     with qtbot.waitSignal(msg.fix_requested, timeout=500):
-        btns[0].click()
+        fix[0].click()
 
 
 # ---------------------------------------------------------------------------

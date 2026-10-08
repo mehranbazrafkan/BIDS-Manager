@@ -12,21 +12,25 @@ the :class:`AppSettings` field defaults.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -38,13 +42,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import agent_service
 from .. import schema
 from ..classifier import sequence_dict
 from ..deface import engines as deface_engines
 from ..deface import run as deface_run
 from ..classifier import user_rules
 from ..util.system_info import SystemInfo, get_system_info
-from .app_settings import AppSettings
+from .app_settings import AI_DEVICE_MAPS, AI_QUANTIZATIONS, AppSettings
 
 
 def _indented(child: QWidget, *, indent: int = 22) -> QWidget:
@@ -68,6 +73,22 @@ def _bind_children(parent_cb: QCheckBox, *children: QWidget) -> None:
             c.setEnabled(checked)
     parent_cb.toggled.connect(_sync)
     _sync(parent_cb.isChecked())
+
+
+# Human wording for the agent's constrained vocabularies. The combo's data
+# role always carries the machine value; only the text is friendly, and
+# app_settings is what decides which values are legal at all.
+_DEVICE_LABELS = {
+    "auto": "Automatic (let PyTorch decide)",
+    "cpu": "CPU only",
+    "cuda": "NVIDIA GPU (CUDA)",
+    "mps": "Apple GPU (MPS)",
+}
+_QUANT_LABELS = {
+    "none": "Full precision (the model as published)",
+    "4bit": "4-bit (about a quarter of the memory)",
+    "8bit": "8-bit (about half the memory)",
+}
 
 
 class SettingsDialog(QDialog):
@@ -99,7 +120,14 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_scan_rules_tab(), "Scan rules")
         tabs.addTab(self._build_convert_tab(), "Convert + post-convert")
         tabs.addTab(self._build_validation_tab(), "Validation")
+        tabs.addTab(self._build_ai_tab(), "AI Agent")
         v.addWidget(tabs, 1)
+        # Connected once, after every tab exists: the AI tab asks the
+        # agent what models it offers the first time it is opened, and a
+        # connection made while tabs were still being added would fire
+        # for the initial selection.
+        self._tabs = tabs
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         # Save / Cancel / Restore defaults.
         buttons = QDialogButtonBox(
@@ -994,6 +1022,436 @@ class SettingsDialog(QDialog):
         v.addStretch(1)
         return w
 
+    def _build_ai_tab(self) -> QWidget:
+        """Whether to offer the AI agent, and what it should run with.
+
+        The agent is BIDS-Manager's to start, so there is no URL here:
+        whichever process spawns a service already knows its address, and
+        a field that only disagrees when something else grabs port 8000
+        is worse than no field at all. What is left is the state of the
+        service, the interpreter to run it with, and the model knobs a
+        normal user can act on.
+        """
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        box = QGroupBox("AI Agent")
+        form = QFormLayout(box)
+
+        self._ai_enabled = QCheckBox(
+            "Show an “Ask AI” button on errors and warnings"
+        )
+        self._ai_enabled.setToolTip(
+            "Adds a small button beside every error and warning the app "
+            "shows. Clicking it sends that finding to the AI agent and "
+            "opens a plain-language explanation of what is wrong, why, "
+            "and how to fix it.\n\n"
+            "On by default. While it is on, BIDS-Manager starts the AI "
+            "agent itself when the app opens, and stops it when you turn "
+            "this off."
+        )
+        form.addRow("", self._ai_enabled)
+
+        # -- is it up? ------------------------------------------------
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        self._ai_status = QLabel("")
+        self._ai_status.setWordWrap(True)
+        self._ai_start_btn = QPushButton("Start")
+        self._ai_start_btn.setToolTip(
+            "Bring the AI agent up now, or stop the one BIDS-Manager "
+            "started.\n\n"
+            "It is a separate process: importing torch and friends takes "
+            "a few seconds, and the first answer also has to load a model."
+        )
+        self._ai_start_btn.clicked.connect(self._on_agent_start_stop)
+        status_row.addWidget(self._ai_status, 1)
+        status_row.addWidget(self._ai_start_btn, 0)
+        form.addRow("Agent:", status_row)
+
+        # -- how to run it --------------------------------------------
+        python_row = QHBoxLayout()
+        python_row.setSpacing(8)
+        self._ai_python = QLineEdit()
+        self._ai_python.setPlaceholderText("Automatic")
+        self._ai_python.setToolTip(
+            "Which Python launches the AI agent.\n\n"
+            "Leave this empty to detect it: BIDS-Manager asks each "
+            "candidate whether it can see flask, torch, transformers and "
+            "laya, and takes the first one that can. The interpreter "
+            "BIDS-Manager itself runs from usually cannot, because it "
+            "does not carry a model runtime.\n\n"
+            "Set it only if detection picks the wrong one."
+        )
+        python_btn = QPushButton("...")
+        python_btn.setFixedWidth(28)
+        python_btn.setToolTip("Browse for a Python interpreter.")
+        python_btn.clicked.connect(self._browse_agent_python)
+        python_row.addWidget(self._ai_python, 1)
+        python_row.addWidget(python_btn, 0)
+        form.addRow("Python:", python_row)
+
+        # -- which model ----------------------------------------------
+        self._ai_model = QComboBox()
+        self._ai_model.setEditable(False)
+        self._ai_model.setToolTip(
+            "The local model that writes the answers.\n\n"
+            "Populated from the agent's own model list; \"as configured "
+            "on the agent\" means BIDS-Manager has no preference and the "
+            "agent's config.json decides.\n\n"
+            "The list is fetched when you open this tab and after "
+            "<b>Test connection</b>. Downloading a model is the agent's "
+            "job and can take a while the first time."
+        )
+        self._ai_model.addItem("— as configured on the agent —", "")
+        form.addRow("Model:", self._ai_model)
+
+        # -- how much it is allowed to write ---------------------------
+        self._ai_tokens = QSpinBox()
+        self._ai_tokens.setRange(16, 8192)
+        self._ai_tokens.setSingleStep(32)
+        self._ai_tokens.setToolTip(
+            "The longest answer, in tokens (roughly 3/4 of a word each).\n\n"
+            "250 is enough for a plain-language explanation. Higher is "
+            "slower, and on CPU the difference is very noticeable; a "
+            "follow-up question may need more room than the first."
+        )
+        form.addRow("Answer length:", self._ai_tokens)
+
+        self._ai_quant = QComboBox()
+        for value in AI_QUANTIZATIONS:
+            self._ai_quant.addItem(_QUANT_LABELS[value], value)
+        self._ai_quant.setToolTip(
+            "How the model's weights are held while it runs.\n\n"
+            "Full precision is exactly the model as published. 4-bit uses "
+            "about a quarter of the memory and 8-bit about half, at some "
+            "cost in answer quality. Both need bitsandbytes; without it "
+            "the agent warns and loads full precision instead.\n\n"
+            "Choose this to fit a smaller GPU (or to stop the model being "
+            "moved to swap)."
+        )
+        form.addRow("Memory:", self._ai_quant)
+
+        self._ai_device = QComboBox()
+        for value in AI_DEVICE_MAPS:
+            self._ai_device.addItem(_DEVICE_LABELS[value], value)
+        self._ai_device.setToolTip(
+            "Where the model runs.\n\n"
+            "Automatic lets PyTorch pick. CPU only is the safe choice on "
+            "a machine with no supported GPU, and CUDA is an NVIDIA card. "
+            "Changing this forces the model to be reloaded on the next "
+            "answer."
+        )
+        form.addRow("Device:", self._ai_device)
+
+        self._ai_think = QCheckBox(
+            "Think step by step before answering"
+        )
+        self._ai_think.setToolTip(
+            "Ask the model to reason through the finding first when the "
+            "model supports it (Qwen3 does; older ones ignore it).\n\n"
+            "Better answers on involved problems, noticeably slower ones "
+            "on simple ones."
+        )
+        form.addRow("", self._ai_think)
+
+        self._ai_temperature = QDoubleSpinBox()
+        self._ai_temperature.setRange(0.0, 2.0)
+        self._ai_temperature.setSingleStep(0.05)
+        self._ai_temperature.setDecimals(2)
+        self._ai_temperature.setToolTip(
+            "How varied the answers are.\n\n"
+            "Lower is focused and the same every time; higher is more "
+            "wide-ranging and occasionally less reliable. 0 means always "
+            "give the single most likely answer.\n\n"
+            "This is applied immediately — the agent re-reads it on the "
+            "next question."
+        )
+        form.addRow("Answer variety:", self._ai_temperature)
+
+        self._ai_timeout = QSpinBox()
+        self._ai_timeout.setRange(5, 3600)
+        self._ai_timeout.setSingleStep(15)
+        self._ai_timeout.setSuffix(" s")
+        self._ai_timeout.setToolTip(
+            "How long to wait for an answer before giving up.\n\n"
+            "The FIRST request loads the local model, which can take a "
+            "minute or two on CPU. Raise this if answers time out and "
+            "the agent's own console shows it is still working."
+        )
+        form.addRow("Request timeout:", self._ai_timeout)
+
+        test_row = QHBoxLayout()
+        test_row.setSpacing(8)
+        test_btn = QPushButton("Test connection")
+        test_btn.setToolTip(
+            "Ask the agent for its model list and current configuration. "
+            "Neither call loads the model, so this is quick even while "
+            "the LLM is still cold."
+        )
+        test_btn.clicked.connect(self._test_agent_connection)
+        self._ai_test_result = QLabel("")
+        self._ai_test_result.setWordWrap(True)
+        self._ai_test_result.setStyleSheet("color: #8b949e;")
+        test_row.addWidget(test_btn)
+        test_row.addWidget(self._ai_test_result, 1)
+        form.addRow("Connection:", test_row)
+
+        v.addWidget(box)
+
+        note = QLabel(
+            "BIDS-Manager starts the agent for you when it opens, on the "
+            "Python detected above (or the one you chose). It is a "
+            "separate local process: it loads a small model onto your "
+            "machine, so the first answer of a session takes a moment.\n\n"
+            "Asking sends the finding &mdash; rule id, field, message and "
+            "file path &mdash; to that service; nothing leaves your "
+            "machine. Its own README lists what it needs installed."
+        )
+        note.setStyleSheet("color: #8b949e;")
+        note.setTextFormat(Qt.TextFormat.RichText)
+        note.setWordWrap(True)
+        v.addWidget(note)
+        v.addStretch(1)
+
+        # The service lives on after this dialog is built, so its state
+        # is polled rather than pushed: a status that only refreshed on
+        # an event would go stale the moment a background start finished.
+        self._ai_models_fetched = False
+        self._ai_timer = QTimer(self)
+        self._ai_timer.setInterval(400)
+        self._ai_timer.timeout.connect(self._update_agent_status)
+        self._ai_timer.start()
+        self.finished.connect(self._ai_timer.stop)
+        self._update_agent_status()
+        return w
+
+    # -- the agent process -------------------------------------------
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Ask the agent for its model list the first time it is shown.
+
+        Deliberately not done in ``__init__``: building Settings must
+        cost nothing when the tab is never opened, and by the time it
+        *is* opened the agent has usually had a few more seconds to come
+        up than it had when the dialog was constructed.
+        """
+        if self._tabs.tabText(index) != "AI Agent":
+            return
+        # Retried until it works: opening the tab while the agent is
+        # still importing torch is the likeliest moment for this to
+        # fail, and a one-shot flag would leave the user staring at a
+        # dropdown with nothing in it for the rest of the session.
+        if self._ai_models_fetched:
+            return
+        self._refresh_agent_models()
+
+    def _update_agent_status(self) -> None:
+        """One poll of ``bidsmgr.agent_service`` into label + button."""
+        svc = agent_service.service()
+        state = svc.state
+        if state == "running":
+            owned = svc.owned
+            self._ai_status.setText(
+                "Running (started by BIDS-Manager)."
+                if owned else "Running (started outside BIDS-Manager)."
+            )
+            self._ai_status.setStyleSheet("color: #3fb950;")
+            self._ai_start_btn.setText("Stop")
+            self._ai_start_btn.setEnabled(owned)
+        elif state == "starting":
+            self._ai_status.setText("Starting...")
+            self._ai_status.setStyleSheet("color: #d29922;")
+            self._ai_start_btn.setText("Start")
+            self._ai_start_btn.setEnabled(False)
+        elif state == "failed":
+            # The first line only: the full message ends in a log tail
+            # that belongs in the tooltip, not in a form row.
+            first = (svc.detail or "Did not start.").splitlines()[0]
+            self._ai_status.setText(first)
+            self._ai_status.setStyleSheet("color: #f85149;")
+            self._ai_start_btn.setText("Start")
+            self._ai_start_btn.setEnabled(True)
+        else:
+            self._ai_status.setText("Not running.")
+            self._ai_status.setStyleSheet("color: #8b949e;")
+            self._ai_start_btn.setText("Start")
+            self._ai_start_btn.setEnabled(True)
+        self._ai_status.setToolTip(svc.detail)
+
+    def _on_agent_start_stop(self) -> None:
+        svc = agent_service.service()
+        if svc.state == "running":
+            svc.stop()
+            self._update_agent_status()
+            return
+        # Read the interpreter straight from the box rather than from
+        # settings: the user may have typed it two seconds ago and not
+        # saved yet, and this is the button that acts on what they see.
+        svc.start(python=self._ai_python.text().strip())
+        self._update_agent_status()
+
+    def _browse_agent_python(self) -> None:
+        start = str(self._ai_python.text().strip() or os.path.expanduser("~"))
+        filters = (
+            "Python interpreter (*.exe);;All files (*)"
+            if os.name == "nt"
+            else "All files (*)"
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose the Python that runs the AI agent",
+            start if os.path.isfile(start) else "", filters,
+        )
+        if path:
+            self._ai_python.setText(path)
+
+    def _refresh_agent_models(self) -> None:
+        """Fill the Model dropdown from the agent, and say where it is.
+
+        Blocking and local-only: ``/models`` and ``/config`` load no
+        model, and a refused connection on loopback is instant. Runs when
+        the tab is opened and again after Test connection, so the list
+        cannot drift away from what the agent actually offers.
+        """
+        from .ai_explainer import AgentClient, AgentError, agent_base_url
+
+        url = agent_base_url()
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            client = AgentClient(base_url=url, timeout=8.0)
+            info = client.ping()
+        except AgentError as exc:
+            self._ai_models_fetched = False
+            self._ai_test_result.setStyleSheet("color: #f85149;")
+            self._ai_test_result.setText(
+                str(exc).splitlines()[0] or "Connection failed."
+            )
+            self._ai_test_result.setToolTip(str(exc))
+            return
+        except Exception as exc:                        # pragma: no cover
+            self._ai_models_fetched = False
+            self._ai_test_result.setStyleSheet("color: #f85149;")
+            self._ai_test_result.setText(str(exc))
+            self._ai_test_result.setToolTip(repr(exc))
+            return
+        finally:
+            self.unsetCursor()
+
+        self._ai_models_fetched = True
+        models = info.get("models") if isinstance(info, dict) else None
+        models = [m for m in (models or []) if isinstance(m, dict) and m.get("name")]
+
+        # What the agent is actually running, which is also what we
+        # should have selected when the user never chose anything.
+        current = ""
+        llm: dict = {}
+        try:
+            cfg = client.config()
+            llm = cfg.get("llm") if isinstance(cfg, dict) else {}
+            if not isinstance(llm, dict):
+                llm = {}
+            current = str(llm.get("model_name") or "").strip()
+        except (AgentError, AttributeError, TypeError):
+            current = ""
+
+        # Show the knobs as they are rather than as they were stored. In
+        # the ordinary flow this changes nothing — BIDS-Manager pushed
+        # these values when it started the agent — but it keeps the tab
+        # honest if somebody edited the agent's own config meanwhile,
+        # instead of letting a save overwrite it with a guess.
+        if llm:
+            self._sync_agent_knobs(llm)
+
+        chosen = self._ai_model.currentData() or ""
+        self._ai_model.clear()
+        self._ai_model.addItem("— as configured on the agent —", "")
+        for entry in models:
+            name = str(entry["name"])
+            label = f"{name}  ·  {entry.get('description', '')}"
+            if entry.get("size"):
+                label += f"  ·  {entry['size']}"
+            if entry.get("vram_gb"):
+                label += f"  ·  {entry['vram_gb']}"
+            self._ai_model.addItem(label, name)
+        self._set_agent_model(chosen or current)
+
+        count = len(models)
+        self._ai_test_result.setStyleSheet("color: #3fb950;")
+        self._ai_test_result.setText(
+            f"Connected to {client.base_url}"
+            + (f"  ·  {count} models" if count else "")
+            + (f"  ·  {current}" if current else "")
+            + "."
+        )
+        self._ai_test_result.setToolTip(
+            f"Model running on the agent: {current}" if current else ""
+        )
+
+    def _sync_agent_knobs(self, llm: dict) -> None:
+        """Show the knobs the way the agent has them, not the way we stored them.
+
+        In the ordinary flow this changes nothing — BIDS-Manager pushes
+        these same values when it starts the agent, so store and reality
+        have just converged. It matters only when they have drifted: a
+        hand-edited ``config.json``, or a value somebody else set while
+        the app was open. Without this, opening Settings, pressing Save
+        and never looking would quietly overwrite somebody else's edit
+        with a guess.
+
+        Silently tolerant: one malformed field out of five should leave
+        the other four right, and a missing one should leave the widget
+        as the user set it.
+        """
+        try:
+            tokens = int(llm["max_new_tokens"])
+        except (KeyError, TypeError, ValueError):
+            tokens = -1
+        if 16 <= tokens <= 8192:
+            self._ai_tokens.setValue(tokens)
+
+        try:
+            temperature = float(llm["temperature"])
+        except (KeyError, TypeError, ValueError):
+            temperature = -1.0
+        if 0.0 <= temperature <= 2.0:
+            self._ai_temperature.setValue(temperature)
+
+        for widget, key, vocabulary in (
+            (self._ai_device, "device_map", AI_DEVICE_MAPS),
+            (self._ai_quant, "quantization", AI_QUANTIZATIONS),
+        ):
+            value = str(llm.get(key) or "").strip().lower()
+            # The agent's own config may predate quantization and only
+            # carry the old boolean, which is still what it acts on.
+            if key == "quantization" and not value and llm.get("load_in_4bit"):
+                value = "4bit"
+            if value in vocabulary:
+                index = widget.findData(value)
+                if index >= 0:
+                    widget.setCurrentIndex(index)
+
+        if isinstance(llm.get("enable_thinking"), bool):
+            self._ai_think.setChecked(llm["enable_thinking"])
+
+    def _set_agent_model(self, name: str) -> None:
+        """Select ``name``, adding it if the agent's list omits it."""
+        name = (name or "").strip()
+        index = self._ai_model.findData(name)
+        if index < 0 and name:
+            self._ai_model.addItem(name, name)
+            index = self._ai_model.findData(name)
+        self._ai_model.setCurrentIndex(index if index >= 0 else 0)
+
+    def _test_agent_connection(self) -> None:
+        """Ping the agent and reload the model list from it.
+
+        Blocking, and capped at eight seconds: a refused connection on
+        localhost is instant, and a wrong address is the case the cap
+        exists for. A spinner for one button press would cost more code
+        than the wait costs patience.
+        """
+        self._refresh_agent_models()
+
     # ------------------------------------------------------------------
     # Widget <-> settings
     # ------------------------------------------------------------------
@@ -1079,6 +1537,25 @@ class SettingsDialog(QDialog):
         shidx = self._validate_show.findData(s.validate_show)
         self._validate_show.setCurrentIndex(shidx if shidx >= 0 else 0)
         self._validate_flag_todos.setChecked(s.validate_flag_todos)
+
+        # AI agent. The result label is cleared rather than reloaded:
+        # a "Connected" from the last open says nothing about now.
+        self._ai_enabled.setChecked(s.ai_enabled)
+        self._ai_timeout.setValue(max(5, int(s.ai_timeout)))
+        self._ai_python.setText(s.ai_python)
+        self._set_agent_model(s.ai_model)
+        self._ai_tokens.setValue(max(16, int(s.ai_max_new_tokens)))
+        self._ai_device.setCurrentIndex(
+            max(0, self._ai_device.findData(s.ai_device_map))
+        )
+        self._ai_quant.setCurrentIndex(
+            max(0, self._ai_quant.findData(s.ai_quantization))
+        )
+        self._ai_think.setChecked(s.ai_enable_thinking)
+        self._ai_temperature.setValue(float(s.ai_temperature))
+        self._ai_test_result.setText("")
+        self._ai_test_result.setStyleSheet("color: #8b949e;")
+        self._ai_test_result.setToolTip("")
 
         # Scan rules: rebuild both editable tables from the persisted lists
         # (clear first so Restore-defaults empties them).
@@ -1171,7 +1648,33 @@ class SettingsDialog(QDialog):
         s.validate_show = self._validate_show.currentData() or "error_warning"
         s.validate_flag_todos = self._validate_flag_todos.isChecked()
 
+        s.ai_enabled = self._ai_enabled.isChecked()
+        s.ai_timeout = self._ai_timeout.value()
+        # ai_base_url deliberately has no widget: BIDS-Manager starts the
+        # agent itself, so the only address worth trusting is the one it
+        # just bound, and a saved URL is a stale one by construction.
+        s.ai_python = self._ai_python.text().strip()
+        s.ai_model = (self._ai_model.currentData() or "").strip()
+        s.ai_max_new_tokens = int(self._ai_tokens.value())
+        s.ai_device_map = self._ai_device.currentData() or "auto"
+        s.ai_quantization = self._ai_quant.currentData() or "none"
+        s.ai_enable_thinking = self._ai_think.isChecked()
+        s.ai_temperature = float(self._ai_temperature.value())
+
         s.save()
+        # Bring the service in line with what was just saved. Both calls
+        # are quick and local: start() returns immediately, and the push
+        # is skipped unless an agent is actually up to receive it (if it
+        # is down, main.py pushes the same payload when it next starts).
+        svc = agent_service.service()
+        if s.ai_enabled and svc.state in ("stopped", "failed"):
+            svc.start(python=s.ai_python)
+        elif not s.ai_enabled and svc.owned:
+            svc.stop()
+        if svc.state == "running":
+            from .ai_explainer import push_llm_config
+            push_llm_config(s)
+
         # Adopt the chosen version now rather than at the next launch: every
         # schema answer in the process is memoised, so this also drops the
         # answers about the old one.

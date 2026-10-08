@@ -97,7 +97,13 @@ def test_every_string_setting_round_trips_a_non_boolish_value():
     # A field whose load path validates against a vocabulary needs a value
     # from that vocabulary, or the round trip legitimately rejects the probe
     # and the test measures the guard instead of the save.
-    constrained = {"nifti_view_mode": "combo"}
+    constrained = {
+        "nifti_view_mode": "combo",
+        # Vocabularies app_settings validates against on load; anything
+        # outside them is reset to the default by design.
+        "ai_device_map": "cpu",
+        "ai_quantization": "4bit",
+    }
     probes = {
         str: "allineate-robust",
     }

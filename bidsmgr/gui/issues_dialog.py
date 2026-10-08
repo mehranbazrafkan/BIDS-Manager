@@ -57,11 +57,16 @@ class _RowCard(QFrame):
         title: str,
         issues: list[str],
         severity: str,
+        context: Optional[dict] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("issue-card")
         self._row = row
+        # Scanner notes, not validator findings: there is no rule id and
+        # no BIDS path yet, so the AI agent gets the inventory row's own
+        # coordinates instead and works out the rest from the text.
+        self._context = dict(context or {})
 
         v = QVBoxLayout(self)
         v.setContentsMargins(10, 8, 10, 8)
@@ -100,7 +105,9 @@ class _RowCard(QFrame):
                 else "Excluded from conversion."
             ]
         for text in issues:
-            v.addWidget(ValMessage(sev_for_badge, "", text, None))
+            v.addWidget(ValMessage(
+                sev_for_badge, "", text, None, context=self._context,
+            ))
 
 
 class IssuesDialog(QDialog):
@@ -257,7 +264,12 @@ class IssuesDialog(QDialog):
                 issues_text = str(df.at[row, "issues"] or "").strip()
             parts = [p.strip() for p in issues_text.split(" | ") if p.strip()]
 
-            card = _RowCard(row, label, parts, severity)
+            card = _RowCard(row, label, parts, severity, context={
+                "row": row + 1,
+                "subject": sub,
+                "source": bn if bn and bn != "—" else "",
+                "row_state": severity,
+            })
             card.activated.connect(self.row_selected.emit)
             self._cards_layout.addWidget(card)
 

@@ -451,6 +451,51 @@ class TestCoherenceDialog:
                 return
         raise AssertionError("the TaskName mismatch was not found")
 
+    def test_a_finding_can_be_handed_to_the_ai_agent(
+        self, qtbot, dataset, monkeypatch,
+    ):
+        """The detail panel's button: coherence findings are described as
+        a before/after table, and a person who wants it in words has
+        nowhere else to ask."""
+        from bidsmgr.gui import ai_explainer
+
+        side = dataset / "sub-001/func/sub-001_task-x_run-1_bold.json"
+        meta = json.loads(side.read_text())
+        meta["TaskName"] = "something else"
+        side.write_text(json.dumps(meta))
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            ai_explainer, "ask",
+            lambda payload, parent=None: seen.update(payload=payload),
+        )
+
+        dlg = CoherenceDialog(dataset)
+        qtbot.addWidget(dlg)
+        # Nothing selected yet, so there is nothing to explain.
+        assert not dlg._ask_btn.isEnabled()
+
+        finding = next(
+            f for f in (
+                item.data(0, Qt.ItemDataRole.UserRole)
+                for item in dlg._leaves()
+            )
+            if f and f.kind.name == "TASK_NAME_MISMATCH"
+        )
+        dlg._show_detail(finding)
+        assert dlg._ask_btn.isEnabled()
+
+        dlg._ask_btn.click()
+
+        payload = seen["payload"]
+        assert payload["rule_id"].startswith("coherence.")
+        assert "TaskName" in payload["message"]
+        assert payload.get("fix_label") == finding.repair
+        assert payload["path"] == (
+            "sub-001/func/sub-001_task-x_run-1_bold.json"
+        )
+        assert payload["check"] == "coherence"
+
     def test_findings_are_grouped_by_kind(self, qtbot, dataset):
         (dataset / "sub-001/func/sub-001_task-x_run-3_bold.nii.gz").unlink()
         (dataset / "sub-001/func/sub-001_task-x_run-3_bold.json").unlink()

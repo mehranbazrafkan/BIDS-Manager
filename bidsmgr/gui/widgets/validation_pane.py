@@ -136,6 +136,38 @@ class _ClipRow(QFrame):
         return hint
 
 
+def _ai_context(
+    root: Optional[Path],
+    path: Optional[Path],
+    verdict: Optional[FileVerdict] = None,
+) -> dict:
+    """What the AI agent needs to place a finding in the dataset.
+
+    ``retriever._issue_structured`` keys its knowledge lookup on
+    ``path`` / ``datatype`` / ``suffix`` beside the rule and the field,
+    and without them a finding about ``RepetitionTime`` cannot tell a
+    PET scan from an fMRI one. The path goes over POSIX-shaped and
+    relative when it can: that is how the dataset addresses itself, and
+    it stops leaking the reviewer's home directory into a prompt.
+    """
+    ctx: dict = {}
+    if path is not None:
+        ctx["path"] = str(path)
+        if root is not None:
+            try:
+                ctx["path"] = path.resolve().relative_to(
+                    root.resolve()
+                ).as_posix()
+            except (ValueError, OSError):
+                pass
+    if verdict is not None:
+        if verdict.datatype:
+            ctx["datatype"] = str(verdict.datatype)
+        if verdict.suffix:
+            ctx["suffix"] = str(verdict.suffix)
+    return ctx
+
+
 def _folder_key_for(root: Optional[Path], path: Optional[Path]) -> Optional[str]:
     """Compute the relative-folder key the validator uses in
     :pyattr:`ValidationReport.folder_issues`.
@@ -410,6 +442,7 @@ class ValidationPane(QWidget):
             self._report.dataset_issues,
             empty_text="No dataset-level issues.",
             target_file=self._current_file,
+            context=_ai_context(self._current_root, self._current_file),
         )
 
         # Section 2: folder issues (parent of current file).
@@ -431,6 +464,7 @@ class ValidationPane(QWidget):
                 else "Select a file to see folder-level findings."
             ),
             target_file=self._current_file,
+            context=_ai_context(self._current_root, self._current_file),
         )
 
         # Section 3: file issues (FileVerdict for current file).
@@ -456,6 +490,7 @@ class ValidationPane(QWidget):
             file_issues,
             empty_text=empty_text,
             target_file=self._current_file,
+            context=_ai_context(self._current_root, self._current_file, verdict),
             highlight_button=True,
         )
 
@@ -473,6 +508,7 @@ class ValidationPane(QWidget):
         *,
         empty_text: str,
         target_file: Optional[Path] = None,
+        context: Optional[dict] = None,
         highlight_button: bool = False,
     ) -> None:
         # The global "Show findings" setting, narrowed by this pane's own
@@ -541,6 +577,7 @@ class ValidationPane(QWidget):
                     fix_label=issue.fix_label,
                     field=issue.field,
                     schema_rule=issue.schema_rule,
+                    context=dict(context or {}),
                 )
                 # Re-emit fix clicks with the file context so the host
                 # panel can jump to the right place.
@@ -650,6 +687,7 @@ class ValidationPane(QWidget):
             fix_label=None,
             field=grp.field,
             schema_rule=grp.schema_rule,
+            context=self._group_context(grp),
         )
         cl.addWidget(msg)
 
@@ -666,6 +704,23 @@ class ValidationPane(QWidget):
         listing.setToolTip("\n".join(str(x) for x in grp.files))
         cl.addWidget(listing)
         return card
+
+    def _group_context(self, grp: FindingGroup) -> dict:
+        """Context for a whole-dataset group of the same finding.
+
+        A group has no single file, so a representative one is named and
+        the rest are listed: the agent's retriever reads ``path`` and
+        ``datatype`` / ``suffix`` to pick the right BIDS rule, and
+        dropping the whole group into a single opaque string would lose
+        the scale of it — which is the only thing that makes "fix it in
+        every file" different from fixing it in one.
+        """
+        ctx: dict = {"affected_files": [str(p) for p in grp.files[:8]]}
+        if len(grp.files) > 8:
+            ctx["affected_file_count"] = len(grp.files)
+        if grp.files:
+            ctx.update(_ai_context(self._current_root, grp.files[0]))
+        return ctx
 
     def _is_accepted(self, target_file, issue):
         """The decision covering this finding, or ``None``."""

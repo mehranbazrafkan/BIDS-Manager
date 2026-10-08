@@ -55,6 +55,7 @@ class CoherenceDialog(QDialog):
         self._root = Path(root)
         self._findings: list[coherence.Finding] = []
         self._applied = 0
+        self._current_finding: Optional[coherence.Finding] = None
 
         self.setWindowTitle("Check coherence")
         self.setModal(True)
@@ -117,10 +118,33 @@ class CoherenceDialog(QDialog):
         split.addWidget(found)
 
         detail, dl = card("What this is, and what the repair would do")
+        what_row = QHBoxLayout()
+        what_row.setSpacing(8)
         self._what = QLabel("Select a finding above.")
         self._what.setObjectName("dlg-hint")
         self._what.setWordWrap(True)
-        dl.addWidget(self._what)
+        what_row.addWidget(self._what, 1)
+        self._ask_btn = QPushButton("Ask AI")
+        self._ask_btn.setObjectName("val-ai")
+        self._ask_btn.setToolTip(
+            "Ask the BIDS AI agent\n\n"
+            "Sends this coherence finding to the AI agent in "
+            "bidsmgr/ai_agent and asks it to explain, in plain language, "
+            "why the files disagree and what settling it would do.\n\n"
+            "BIDS-Manager starts that agent for you when it opens, so "
+            "there is nothing to run by hand. The first answer of a "
+            "session loads a local model and takes a moment; if it "
+            "could not start, the answer window says why and points at "
+            "Settings → AI Agent, where you can start it yourself."
+        )
+        self._ask_btn.clicked.connect(self._ask_ai)
+        self._ask_btn.setEnabled(False)
+        # Offered only when the feature is on: the toggle is also what
+        # makes BIDS-Manager start the agent, so off means no service.
+        from .ai_explainer import ai_enabled
+        self._ask_btn.setVisible(ai_enabled())
+        what_row.addWidget(self._ask_btn, 0, Qt.AlignmentFlag.AlignTop)
+        dl.addLayout(what_row)
 
         self._detail = QTreeWidget()
         self._detail.setObjectName("check-tree")
@@ -209,6 +233,8 @@ class CoherenceDialog(QDialog):
 
     def _show_detail(self, finding: Optional[coherence.Finding]) -> None:
         self._detail.clear()
+        self._current_finding = finding
+        self._ask_btn.setEnabled(finding is not None)
         if finding is None:
             self._what.setText("Select a finding above.")
             return
@@ -241,6 +267,39 @@ class CoherenceDialog(QDialog):
             ])
         self._detail.resizeColumnToContents(0)
         self._detail.resizeColumnToContents(1)
+
+    def _ask_ai(self) -> None:
+        """Hand the selected coherence finding to the AI agent."""
+        finding = self._current_finding
+        if finding is None:
+            return
+        # Deferred for the same reason ValMessage defers it: the
+        # explainer drags in dialog chrome and a spinner that nothing
+        # needs until somebody actually clicks.
+        from .ai_explainer import ask, build_payload
+
+        kind = finding.kind
+        ask(
+            build_payload(
+                severity="warn",
+                # Coherence findings carry no validator rule id, but the
+                # agent's retriever keys on one and this is the only
+                # handle we have: the kind, in the app's dotted style.
+                rule_id=f"coherence.{kind.name.lower()}",
+                message=f"{kind.value}. {finding.detail}",
+                fix_label=finding.repair,
+                fix_action=finding.repair,
+                extra={
+                    "path": self._where(finding),
+                    "affected_files": [
+                        self._where(f) for f in finding.files[:8]
+                    ],
+                    "repairable": bool(finding.fixable),
+                    "check": "coherence",
+                },
+            ),
+            parent=self,
+        )
 
     # -- selection --------------------------------------------------------
 

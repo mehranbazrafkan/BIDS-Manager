@@ -1187,6 +1187,59 @@ QPushButton#val-fix, QPushButton#val-highlight-all {
 }
 QPushButton#val-fix:hover, QPushButton#val-highlight-all:hover { background: $accent; color: $primary_btn_text; }
 
+/* "Ask AI" — hands this one finding to the bundled AI agent for a
+ * plain-language explanation. Purple, because it is the only button on
+ * a finding that asks a question rather than acting on the dataset.
+ * The hover flips to a solid fill for the same reason the accent pair
+ * above does: on the amber / red finding backgrounds a tint-on-tint
+ * button is nearly invisible. */
+QPushButton#val-ai {
+    background: $purple_bg;
+    color: $purple;
+    border: 1px solid $purple_border;
+    border-radius: 3px;
+    padding: 1px 7px;
+    font-size: 10px;
+}
+QPushButton#val-ai:hover { background: $purple; color: $primary_btn_text; }
+QPushButton#val-ai:disabled {
+    background: transparent;
+    color: $muted;
+    border: 1px solid $border;
+}
+
+/* ------------------------------------------------------------------
+ * AI explanation dialog
+ * ------------------------------------------------------------------ */
+QLabel#ai-fact {
+    font-family: "SF Mono","Menlo","Monaco","Consolas",monospace;
+    font-size: 10px;
+    color: $text;
+}
+QTextEdit#ai-answer {
+    background: $surface2;
+    color: $text;
+    border: 1px solid $subtle;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 11px;
+    selection-background-color: $accent;
+    selection-color: $primary_btn_text;
+}
+QTextEdit#ai-answer:focus { border-color: $accent_border; }
+QLabel#ai-meta {
+    font-size: 10px;
+    color: $muted;
+}
+QLabel#ai-error {
+    color: $error;
+    font-size: 11px;
+    background: $error_bg;
+    border: 1px solid $error_border;
+    border-radius: 4px;
+    padding: 8px 10px;
+}
+
 /* ---------- Scrollbars ---------- */
 QScrollBar:vertical {
     background: transparent;

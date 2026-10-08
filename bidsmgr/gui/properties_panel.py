@@ -428,7 +428,7 @@ class PropertiesPanel(QWidget):
         # entity-set verdicts. Both render with the same ValMessage
         # widget so the user sees them as one ranked list.
         self._body_layout.addSpacing(8)
-        for vmsg in self._build_row_issue_messages(row):
+        for vmsg in self._build_row_issue_messages(row, datatype, suffix):
             self._body_layout.addWidget(vmsg)
         for vmsg in self._build_validation_messages(datatype, suffix, entities):
             self._body_layout.addWidget(vmsg)
@@ -605,7 +605,9 @@ class PropertiesPanel(QWidget):
     def _color_path_segment(text: str, color: str) -> str:
         return f'<span style="color:{color}">{text}</span>'
 
-    def _build_row_issue_messages(self, row: int) -> list[QWidget]:
+    def _build_row_issue_messages(
+        self, row: int, datatype: str = "", suffix: str = "",
+    ) -> list[QWidget]:
         """One ``ValMessage`` per scanner-detected issue on the selected row.
 
         Severity is derived from the model's ``row_state``: ``err`` →
@@ -620,6 +622,14 @@ class PropertiesPanel(QWidget):
             return []
         state = self._model.row_state(row)
         sev = {"err": "err", "warn": "warn", "skip": "warn"}.get(state, "warn")
+        # Row coordinates plus what the row is *about*. Scanner notes are
+        # free text with no rule id, so the datatype and suffix are the
+        # only structure the AI agent has to anchor a retrieval on.
+        ctx: dict = {"row": row + 1, "row_state": state}
+        if datatype:
+            ctx["datatype"] = str(datatype)
+        if suffix:
+            ctx["suffix"] = str(suffix)
 
         msgs: list[QWidget] = []
         for i, text in enumerate(issues):
@@ -627,7 +637,7 @@ class PropertiesPanel(QWidget):
             # follow-up entries are continuations of the same row so
             # the label is just blank to keep the column quiet.
             rule = f"SCANNER · {state}" if i == 0 else ""
-            msgs.append(ValMessage(sev, rule, text, None))
+            msgs.append(ValMessage(sev, rule, text, None, context=ctx))
         return msgs
 
     def _build_validation_messages(
@@ -650,13 +660,19 @@ class PropertiesPanel(QWidget):
                 None,
             ))
             return out
+        # The agent's retriever keys on datatype / suffix as much as on
+        # the rule id: a bare ``entity.required`` does not say whether
+        # the answer differs for PET and for fMRI.
+        ctx = {"datatype": datatype, "suffix": suffix}
         for v in verdicts:
             sev = {
                 schema_mod.Severity.ERROR: "err",
                 schema_mod.Severity.WARNING: "warn",
                 schema_mod.Severity.INFO: "ok",
             }.get(v.severity, "warn")
-            out.append(ValMessage(sev, v.rule_id, v.message, None))
+            out.append(ValMessage(
+                sev, v.rule_id, v.message, None, context=ctx,
+            ))
         return out
 
     @staticmethod
