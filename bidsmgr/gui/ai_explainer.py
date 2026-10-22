@@ -31,6 +31,7 @@ freeze the window.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import logging
@@ -39,9 +40,10 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -64,6 +66,7 @@ from .dialog_chrome import (
     card,
     scrollable_body,
 )
+from .theme_manager import CUR
 from .widgets.spinner import BusySpinner
 
 log = logging.getLogger(__name__)
@@ -82,6 +85,45 @@ DEFAULT_PROMPT = "Explain this BIDS validation finding to me."
 # process with it, and "close while the model is still answering" is the
 # first thing anybody does. See :func:`_retire`.
 _ORPHANS: set[QThread] = set()
+
+
+# =====================================================================
+# Conversation
+# =====================================================================
+
+# What has been asked and answered about a finding, kept for as long as
+# the app runs. It lives here rather than in the dialog for two reasons:
+# the dialog is destroyed on close by design, and reopening a finding is
+# precisely the moment the user expects to find it again.
+_CONVERSATIONS: dict[str, list[dict]] = {}
+
+# Bounded so an afternoon of follow-ups cannot grow either the window or
+# the prompt without limit. Oldest turns fall off the front.
+MAX_TURNS = 40
+
+# How much of that transcript travels back with the next question — the
+# prompt already carries the finding itself, so only the exchange has to
+# be sent, and only so far back.
+HISTORY_SENT = 12
+
+
+def conversation_key(payload: dict) -> str:
+    """The identity of the finding, not of the moment it was asked about.
+
+    ``rule + file + field`` is what a person means by "that error
+    again": the same problem in the same place is the same conversation
+    however the message happened to be worded. The digest is a fallback
+    for findings that carry none of those — a coherence warning with no
+    path, say — where the whole payload is all there is to go on.
+    """
+    parts = [
+        str(payload.get(k) or "").strip()
+        for k in ("rule_id", "path", "field", "datatype", "suffix")
+    ]
+    if "|".join(parts).strip("|"):
+        return "|".join(parts)
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
 # =====================================================================
@@ -331,13 +373,31 @@ class AgentClient:
         """
         return self._request("PUT", "/config", dict(fields))
 
-    def predict(self, user_input: str, context: dict) -> dict:
-        """Run the agent. Returns ``{response, intent, tool_used}``."""
-        out = self._request(
-            "POST",
-            "/predict",
-            {"user_input": str(user_input), "context": dict(context)},
-        )
+    def predict(
+        self,
+        user_input: str,
+        context: dict,
+        history: Optional[list] = None,
+    ) -> dict:
+        """Run the agent. Returns ``{response, intent, tool_used}``.
+
+        ``history`` is the transcript of this conversation so far, so a
+        follow-up question has the earlier ones to stand on. Omitted when
+        there is nothing yet — the first ask of a finding.
+        """
+        body: dict[str, Any] = {
+            "user_input": str(user_input),
+            "context": dict(context),
+        }
+        turns = [
+            t for t in (history or [])
+            if isinstance(t, dict)
+            and str(t.get("role") or "").strip().lower() in ("user", "assistant")
+            and str(t.get("content") or "").strip()
+        ]
+        if turns:
+            body["history"] = turns[-HISTORY_SENT:]
+        out = self._request("POST", "/predict", body)
         out.setdefault("response", "")
         out.setdefault("intent", "")
         if not str(out["response"]).strip():
@@ -472,11 +532,16 @@ class _PredictWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(
-        self, user_input: str, context: dict, parent=None,
+        self,
+        user_input: str,
+        context: dict,
+        history: Optional[list] = None,
+        parent=None,
     ) -> None:
         super().__init__(parent)
         self._user_input = user_input
         self._context = dict(context)
+        self._history = list(history or [])
 
     def run(self) -> None:                               # noqa: D102
         try:
@@ -485,7 +550,9 @@ class _PredictWorker(QThread):
             # connection during that window would be reported to the user
             # as "the agent is not running" when it is very much on its way.
             service().wait_running(timeout=60.0)
-            result = AgentClient().predict(self._user_input, self._context)
+            result = AgentClient().predict(
+                self._user_input, self._context, history=self._history,
+            )
         except AgentError as exc:
             log.info("AI agent request failed: %s", exc)
             self.failed.emit(str(exc))
@@ -512,6 +579,7 @@ def _spawn(
     user_input: str,
     context: dict,
     *,
+    history: Optional[list] = None,
     on_done,
     on_failed,
 ) -> _PredictWorker:
@@ -522,7 +590,7 @@ def _spawn(
     inside a few milliseconds, and a slot connected a moment too late
     never fires — which leaves the dialog stuck on "Working…" forever.
     """
-    worker = _PredictWorker(user_input, context)
+    worker = _PredictWorker(user_input, context, history=history)
     worker.done.connect(on_done)
     worker.failed.connect(on_failed)
     # Parentless by construction (``parent=None`` above): never a child
@@ -534,21 +602,91 @@ def _spawn(
 
 
 # =====================================================================
+# Transcript bubbles
+# =====================================================================
+class BubbleColors(NamedTuple):
+    """The four colours a single turn of the chat is drawn with."""
+
+    name: str    # the sender label
+    fill: str    # the bubble behind the words
+    border: str  # its outline
+    text: str    # the words themselves
+
+
+def _mix(fg: str, bg: str, alpha: float) -> str:
+    """Blend *fg* over *bg* at *alpha*, returned as an opaque hex.
+
+    Qt's rich-text engine is unreliable about ``rgba()`` in a ``style``
+    attribute, so a translucent bubble has to be flattened here — over
+    the surface the widget actually paints it on, which is what makes a
+    light window and a dark one each look intentional.
+    """
+    a, b = QColor(fg), QColor(bg)
+    return "#{:02x}{:02x}{:02x}".format(
+        round(a.red() * alpha + b.red() * (1 - alpha)),
+        round(a.green() * alpha + b.green() * (1 - alpha)),
+        round(a.blue() * alpha + b.blue() * (1 - alpha)),
+    )
+
+
+def chat_bubble(side: str, who: str, text: str, colors: BubbleColors) -> str:
+    """One turn of the transcript as HTML, as a bubble on *side*.
+
+    The spacer cell beside it is what keeps a long answer from
+    swallowing the window: Qt shrinks a table to fit its content, so
+    without something to push against, an eight-line answer would paint
+    itself edge to edge and stop reading as a message.
+    """
+    body = html.escape(str(text or "")).replace("\r\n", "\n")
+    body = body.replace("\n", "<br>")
+    inner = (
+        '<table cellspacing="0" cellpadding="6" '
+        f'style="background-color:{colors.fill}; '
+        f'border:1px solid {colors.border};">'
+        f'<tr><td style="color:{colors.text};">'
+        f'<span style="color:{colors.name}; font-weight:bold;">'
+        f"{html.escape(who)}</span>"
+        f"<br>{body}</td></tr></table>"
+    )
+    if side == "right":
+        cells = (
+            '<td width="25%"></td>'
+            f'<td width="75%" align="right" valign="top">{inner}</td>'
+        )
+    else:
+        cells = (
+            f'<td width="75%" align="left" valign="top">{inner}</td>'
+            '<td width="25%"></td>'
+        )
+    return (
+        '<table width="100%" cellspacing="0" cellpadding="0" '
+        'style="margin-bottom:7px;">'
+        f"<tr>{cells}</tr></table>"
+    )
+
+
+# =====================================================================
 # Dialog
 # =====================================================================
 
 class AiExplainDialog(QDialog):
-    """One finding, and what the agent makes of it.
+    """One finding, and the whole conversation about it.
 
     Modeless — findings come in groups and closing the window to read
     the next one would be a chore. The reported side never changes; the
-    answer area refills on every ask, so a follow-up question replaces
-    the previous answer while keeping the finding on screen.
+    chat below accumulates every question and every answer, so a
+    follow-up reads like a conversation instead of replacing what was
+    said before.
+
+    Reopening a finding restores that conversation rather than
+    regenerating it: :func:`ask` only fires the model when there is
+    nothing to show, which is what makes "I read this error earlier"
+    cost nothing the second time.
     """
 
     def __init__(self, payload: dict, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("BIDS-Manager — AI explanation")
+        self.setWindowTitle("BIDS-Manager - AI Explanation")
         self.resize(660, 640)
         self.setMinimumWidth(440)
 
@@ -556,13 +694,24 @@ class AiExplainDialog(QDialog):
         # A flag, not the thread. Holding the QThread here is what makes
         # "user closes the dialog while the model is answering" unsafe.
         self._busy = False
-        self._last_prompt = DEFAULT_PROMPT
+        self._started = 0.0
+
+        # The transcript, shared with the module-level store: the dialog
+        # mutates it and a later dialog for the same finding reads it
+        # back. Aliasing rather than copying is the point — there is one
+        # conversation, not one per window.
+        self._key = conversation_key(self._payload)
+        self._history: list[dict] = _CONVERSATIONS.setdefault(self._key, [])
+        self._restored = bool(self._history)
+        self._last_prompt = (
+            self._previous_prompt() if self._restored else DEFAULT_PROMPT
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        outer.addWidget(build_header("AI explanation", self._subtitle()))
+        outer.addWidget(build_header("AI Explanation", self._subtitle()))
 
         scroll, body = scrollable_body()
         body.setSpacing(12)
@@ -576,7 +725,7 @@ class AiExplainDialog(QDialog):
             "Ask again", QDialogButtonBox.ButtonRole.ActionRole,
         )
         self._copy_btn = buttons.addButton(
-            "Copy answer", QDialogButtonBox.ButtonRole.ActionRole,
+            "Copy conversation", QDialogButtonBox.ButtonRole.ActionRole,
         )
         buttons.addButton(QDialogButtonBox.StandardButton.Close)
         self._status = QLabel("")
@@ -588,6 +737,21 @@ class AiExplainDialog(QDialog):
         self._copy_btn.clicked.connect(self._copy)
 
         self._set_busy(False)
+        self._render()
+        if self._restored:
+            # Spoken after ``_set_busy(False)``, which clears the line:
+            # this window opens on a conversation from before, and
+            # "nothing was re-generated" is the whole point of it.
+            self._status.setText(
+                "Earlier conversation restored — nothing was re-generated."
+            )
+
+    def _previous_prompt(self) -> str:
+        """The question to put back in front of "Ask again" on restore."""
+        for turn in reversed(self._history):
+            if turn.get("role") == "user":
+                return str(turn.get("content") or "") or DEFAULT_PROMPT
+        return DEFAULT_PROMPT
 
     # -- construction ------------------------------------------------
 
@@ -659,7 +823,7 @@ class AiExplainDialog(QDialog):
         return out
 
     def _build_answer(self, body: QVBoxLayout) -> None:
-        frame, lay = card("What the AI agent says")
+        frame, lay = card("Conversation with the AI Agent")
 
         self._spinner = BusySpinner()
         lay.addWidget(self._spinner)
@@ -670,14 +834,13 @@ class AiExplainDialog(QDialog):
         self._error.setVisible(False)
         lay.addWidget(self._error)
 
+        # A transcript rather than a single answer box: every turn is
+        # rendered together from ``_history``, so the window can be
+        # rebuilt from scratch on restore without re-asking anything.
         self._answer = QTextEdit()
         self._answer.setObjectName("ai-answer")
         self._answer.setReadOnly(True)
-        self._answer.setAcceptRichText(False)
         self._answer.setMinimumHeight(150)
-        self._answer.setPlaceholderText(
-            "The agent's explanation will appear here."
-        )
         lay.addWidget(self._answer, 1)
 
         self._meta = QLabel("")
@@ -691,7 +854,7 @@ class AiExplainDialog(QDialog):
         row.setSpacing(6)
         self._followup = QLineEdit()
         self._followup.setPlaceholderText(
-            "Ask a follow-up about this finding  (Enter to send)"
+            "Ask another question about this finding  (Enter to send)"
         )
         self._followup.setClearButtonEnabled(True)
         self._followup.returnPressed.connect(self._send_followup)
@@ -720,6 +883,17 @@ class AiExplainDialog(QDialog):
             return
         prompt = str(prompt or "").strip() or DEFAULT_PROMPT
         self._last_prompt = prompt
+        # Captured before the new question joins it: sending the same
+        # words twice would read to the model as if they were asked
+        # twice.
+        known = [
+            dict(t) for t in self._history[-HISTORY_SENT:]
+            if t.get("role") in ("user", "assistant")
+        ]
+        # On screen the moment it is sent rather than when it is
+        # answered, which is what makes a long first answer look like a
+        # conversation instead of a freeze.
+        self._append("user", prompt)
         self._set_busy(True)
         self._started = time.time()
         # The thread is owned by ``_ORPHANS``, not by this dialog; only
@@ -728,9 +902,80 @@ class AiExplainDialog(QDialog):
         _spawn(
             prompt,
             self._payload,
+            history=known,
             on_done=self._on_done,
             on_failed=self._on_failed,
         )
+
+    def restored(self) -> bool:
+        """True when this window opened on a conversation from before.
+
+        Public for the same reason :meth:`is_busy` is: it is what
+        :func:`ask` needs to decide whether to generate anything, and a
+        caller reaching for ``_restored`` would pin the dialog to an
+        implementation detail.
+        """
+        return self._restored
+
+    def _append(self, role: str, text: str) -> None:
+        """Add one turn to the shared transcript and redraw."""
+        self._history.append({"role": role, "content": str(text)})
+        if len(self._history) > MAX_TURNS:
+            del self._history[: len(self._history) - MAX_TURNS]
+        self._render()
+
+    def _chat_colors(self) -> dict[str, BubbleColors]:
+        """Bubble colours for both sides, read out of the active theme.
+
+        Green is the side the user is on in every messenger there is,
+        and violet is the assistant's. Neither is picked here: they
+        come from ``CUR()``, so a light window and a dark one each get
+        a transcript that belongs to it instead of a scheme bolted on
+        top.
+        """
+        pal = CUR()
+        surface = pal.get("surface2", "#ffffff")
+        text = pal.get("text", "#000000")
+        out: dict[str, BubbleColors] = {}
+        for side, token in (("user", "success"), ("agent", "purple")):
+            ink = pal.get(token, "#888888")
+            out[side] = BubbleColors(
+                name=ink,
+                fill=_mix(ink, surface, 0.16),
+                border=_mix(ink, surface, 0.42),
+                text=text,
+            )
+        return out
+
+    def _render(self) -> None:
+        """Redraw the whole transcript from ``_history``.
+
+        Rebuilt rather than appended to, because the window can be
+        opened on a conversation that already exists — rendering is
+        what turns that stored list back into a readable exchange.
+        """
+        if not self._history:
+            self._answer.clear()
+            self._answer.setPlaceholderText(
+                "Nothing asked yet. Your questions and the agent's "
+                "answers collect here."
+            )
+            return
+        colors = self._chat_colors()
+        blocks = []
+        for turn in self._history:
+            mine = turn.get("role") == "user"
+            blocks.append(
+                chat_bubble(
+                    "right" if mine else "left",
+                    "You" if mine else "AI Agent",
+                    str(turn.get("content") or ""),
+                    colors["user" if mine else "agent"],
+                )
+            )
+        self._answer.setHtml("".join(blocks))
+        bar = self._answer.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _send_followup(self) -> None:
         text = self._followup.text().strip()
@@ -754,25 +999,50 @@ class AiExplainDialog(QDialog):
             self._error.setVisible(False)
             self._status.setText("Working…")
         else:
-            self._status.setText(
-                f"Agent at {agent_base_url()}"
-            )
+            # Nothing by default. Every caller that has something worth
+            # reporting writes the line itself as soon as this returns;
+            # filling it with the agent's address here would say the
+            # same thing after every answer and bury the one sentence
+            # that explains a restored window.
+            self._status.clear()
 
     def _on_done(self, result: dict) -> None:
-        elapsed = time.time() - getattr(self, "_started", time.time())
+        elapsed = time.time() - self._started
+        # The answer joins the transcript before anything else happens,
+        # so the window is never showing a question with no reply.
+        self._append("assistant", str(result.get("response") or ""))
         self._set_busy(False)
         self._error.setVisible(False)
-        self._answer.setPlainText(str(result.get("response") or ""))
         intent = str(result.get("intent") or "").strip() or "—"
         tool = str(result.get("tool_used") or "").strip()
-        bits = [f"intent: {intent}"]
+        answers = sum(
+            1 for t in self._history if t.get("role") == "assistant"
+        )
+        bits: list[str] = []
+        if answers > 1:
+            bits.append(f"{answers} answers in this conversation")
+        bits.append(f"intent: {intent}")
         if tool:
             bits.append(f"tool: {tool}")
-        bits.append(f"{elapsed:.1f}s")
+        if answers > 1:
+            bits.append(f"last answer {elapsed:.1f}s")
+        else:
+            bits.append(f"{elapsed:.1f}s")
         self._meta.setText("  ·  ".join(bits))
         self._followup.setFocus()
 
     def _on_failed(self, message: str) -> None:
+        # A question nobody answered is not part of the conversation, so
+        # it comes back out of the transcript and into the box it came
+        # from: one Enter away from a retry instead of retyping, and no
+        # run of unanswered turns left behind for the next opener to
+        # wonder about.
+        if self._history and self._history[-1].get("role") == "user":
+            orphan = str(self._history[-1].get("content") or "")
+            self._history.pop()
+            self._render()
+            if not self._followup.text().strip():
+                self._followup.setText(orphan)
         self._set_busy(False)
         # A WrapLabel, not a QTextEdit: the answer area is a text edit
         # for copyability, but this is a short paragraph of prose and it
@@ -787,7 +1057,7 @@ class AiExplainDialog(QDialog):
         if not text:
             return
         QApplication.clipboard().setText(text)
-        self._status.setText("Answer copied to the clipboard.")
+        self._status.setText("Conversation copied to the clipboard.")
 
 
 # =====================================================================
@@ -795,22 +1065,97 @@ class AiExplainDialog(QDialog):
 # =====================================================================
 
 def ask(payload: dict, parent=None) -> Optional[AiExplainDialog]:
-    """Open an explanation window for *payload* and start the request.
+    """Open an explanation window for *payload*, generating only if needed.
 
     Returns the dialog (so a caller could, say, test it) or ``None``
     when the feature is switched off in Settings. Modeless and
     ``WA_DeleteOnClose``: findings are clicked one after another and a
     window that outlives its purpose is a leak.
+
+    A finding that has been asked about before opens on that
+    conversation with **no** request: the user is coming back to
+    something they already read, and regenerating would spend a minute
+    of model time to hand them a different answer to the same question.
     """
     if not ai_enabled():
         return None
     dlg = AiExplainDialog(payload, parent=parent)
     dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-    dlg.start()
+    if not dlg.restored():
+        dlg.start()
     dlg.show()
     dlg.raise_()
     dlg.activateWindow()
     return dlg
+
+
+def hardware_text(hardware: Any) -> tuple[str, str]:
+    """``(text, tooltip)`` for the Hardware row in Settings.
+
+    The agent reports what PyTorch in *its* process can actually open,
+    which is the only thing that answers "what will be used to generate
+    my answers" — a desktop app can see that a card exists, not whether
+    the runtime it will hand it to was built for it.
+
+    Deliberately wording only: the detection has to stay in the agent,
+    and this has to be testable without one.
+    """
+    if not isinstance(hardware, dict) or not hardware.get("backend"):
+        return (
+            "Not reported yet.",
+            "The agent reports this as soon as it is running — the "
+            "detection loads no model, so it costs nothing. Press "
+            "<b>Test connection</b> to fetch it.",
+        )
+
+    backend = str(hardware.get("backend") or "").strip().lower()
+    name = str(hardware.get("device_name") or "").strip()
+    cores = hardware.get("cpu_cores")
+
+    if backend == "cuda":
+        bits = [name or "NVIDIA GPU", "CUDA"]
+        if hardware.get("cuda_version"):
+            bits[1] = f"CUDA {hardware['cuda_version']}"
+        if hardware.get("memory_gb"):
+            bits.append(f"{hardware['memory_gb']} GB")
+        count = int(hardware.get("device_count") or 0)
+        if count > 1:
+            bits.append(f"{count} cards")
+        text = "  ·  ".join(b for b in bits if b)
+    elif backend == "mps":
+        text = f"{name or 'Apple GPU'}  ·  Apple GPU (MPS)"
+    elif backend == "cpu":
+        text = "CPU only"
+        if cores:
+            text += f"  ·  {cores} cores"
+    else:
+        text = name or "Unknown"
+
+    tip_bits = [
+        b for b in (
+            f"PyTorch {hardware.get('torch')}" if hardware.get("torch") else "",
+            f"Python {hardware.get('python')}" if hardware.get("python") else "",
+        ) if b
+    ]
+    tip = "Reported by the agent.\n" + "\n".join(tip_bits)
+    if backend == "cuda":
+        tip += (
+            "\n\nThis is what <b>Automatic</b> under Device resolves to, "
+            "and where 4-bit and 8-bit memory savings come from."
+        )
+    elif backend == "mps":
+        tip += (
+            "\n\nThis is what <b>Automatic</b> under Device resolves to: "
+            "answers are generated on the Apple GPU."
+        )
+    elif backend == "cpu":
+        tip += (
+            "\n\nNo CUDA or Apple GPU is available to the agent, so "
+            "answers are generated on the CPU. That works — it is "
+            "slower than a GPU, and <b>Answer length</b> is the setting "
+            "that controls how long a single answer takes."
+        )
+    return text, tip
 
 
 __all__ = [
@@ -824,5 +1169,7 @@ __all__ = [
     "agent_timeout",
     "ask",
     "build_payload",
+    "conversation_key",
+    "hardware_text",
     "plain_text",
 ]

@@ -85,7 +85,7 @@ _DEVICE_LABELS = {
     "mps": "Apple GPU (MPS)",
 }
 _QUANT_LABELS = {
-    "none": "Full precision (the model as published)",
+    "none": "Full precision (16-bit, exactly as published)",
     "4bit": "4-bit (about a quarter of the memory)",
     "8bit": "8-bit (about half the memory)",
 }
@@ -1111,10 +1111,14 @@ class SettingsDialog(QDialog):
         self._ai_tokens.setRange(16, 8192)
         self._ai_tokens.setSingleStep(32)
         self._ai_tokens.setToolTip(
-            "The longest answer, in tokens (roughly 3/4 of a word each).\n\n"
-            "250 is enough for a plain-language explanation. Higher is "
-            "slower, and on CPU the difference is very noticeable; a "
-            "follow-up question may need more room than the first."
+            "The longest answer, in tokens.\n\n"
+            "A token is roughly 3/4 of an English word, so 512 is about "
+            "380 words and the default 250 about 190. It is a ceiling, "
+            "not a target — a short answer stops as soon as it is "
+            "finished.\n\n"
+            "Higher is slower, and on CPU the difference is very "
+            "noticeable; a follow-up question may need more room than "
+            "the first."
         )
         form.addRow("Answer length:", self._ai_tokens)
 
@@ -1123,12 +1127,19 @@ class SettingsDialog(QDialog):
             self._ai_quant.addItem(_QUANT_LABELS[value], value)
         self._ai_quant.setToolTip(
             "How the model's weights are held while it runs.\n\n"
-            "Full precision is exactly the model as published. 4-bit uses "
-            "about a quarter of the memory and 8-bit about half, at some "
-            "cost in answer quality. Both need bitsandbytes; without it "
-            "the agent warns and loads full precision instead.\n\n"
-            "Choose this to fit a smaller GPU (or to stop the model being "
-            "moved to swap)."
+            "Full precision means <b>16-bit</b>: these models are "
+            "published as 16-bit weights, so this loads them exactly as "
+            "they are — it is not 32-bit, and going to 32-bit would "
+            "double the memory for nothing.\n\n"
+            "4-bit uses about a quarter of the memory and 8-bit about "
+            "half, at some cost in answer quality. Both need "
+            "bitsandbytes; without it the agent warns and loads full "
+            "precision instead.\n\n"
+            "Quantizing is paid once, when the model is loaded — a few "
+            "extra seconds — and never on an individual answer. After "
+            "that it is faster, not slower.\n\n"
+            "Choose this to fit a smaller GPU (or to stop the model "
+            "being moved to swap)."
         )
         form.addRow("Memory:", self._ai_quant)
 
@@ -1137,12 +1148,33 @@ class SettingsDialog(QDialog):
             self._ai_device.addItem(_DEVICE_LABELS[value], value)
         self._ai_device.setToolTip(
             "Where the model runs.\n\n"
-            "Automatic lets PyTorch pick. CPU only is the safe choice on "
-            "a machine with no supported GPU, and CUDA is an NVIDIA card. "
+            "Automatic lets PyTorch pick — the <b>Hardware</b> row below "
+            "says what that resolves to on this machine. CPU only is "
+            "the safe choice on a machine with no supported GPU, and "
+            "CUDA is an NVIDIA card.\n\n"
             "Changing this forces the model to be reloaded on the next "
             "answer."
         )
         form.addRow("Device:", self._ai_device)
+
+        # What the answers will actually be generated with. Filled from
+        # the agent's own report — the process doing the work is the
+        # only one that knows which devices it can open — and reworded
+        # when Device changes, so a choice this machine cannot honour is
+        # visible before it is saved rather than after it fails to load.
+        self._ai_hardware_data: dict = {}
+        self._ai_hardware = QLabel("")
+        self._ai_hardware.setWordWrap(True)
+        self._ai_hardware.setStyleSheet("color: #8b949e;")
+        self._ai_hardware.setText("Not reported yet.")
+        self._ai_hardware.setToolTip(
+            "The agent reports this once it is running. Detection loads "
+            "no model, so it costs nothing."
+        )
+        self._ai_device.currentIndexChanged.connect(
+            self._update_hardware_row
+        )
+        form.addRow("Hardware:", self._ai_hardware)
 
         self._ai_think = QCheckBox(
             "Think step by step before answering"
@@ -1345,14 +1377,21 @@ class SettingsDialog(QDialog):
         # should have selected when the user never chose anything.
         current = ""
         llm: dict = {}
+        cfg: dict = {}
         try:
-            cfg = client.config()
+            got = client.config()
+            if isinstance(got, dict):
+                cfg = got
             llm = cfg.get("llm") if isinstance(cfg, dict) else {}
             if not isinstance(llm, dict):
                 llm = {}
             current = str(llm.get("model_name") or "").strip()
         except (AgentError, AttributeError, TypeError):
             current = ""
+
+        hardware = cfg.get("hardware")
+        self._ai_hardware_data = hardware if isinstance(hardware, dict) else {}
+        self._update_hardware_row()
 
         # Show the knobs as they are rather than as they were stored. In
         # the ordinary flow this changes nothing — BIDS-Manager pushed
@@ -1386,6 +1425,47 @@ class SettingsDialog(QDialog):
         self._ai_test_result.setToolTip(
             f"Model running on the agent: {current}" if current else ""
         )
+
+    def _update_hardware_row(self) -> None:
+        """Say what will generate the answers — and flag a Device that can't.
+
+        Reworded on every Device change rather than only when the
+        hardware arrives, because the row's whole job is to be read
+        *while* the combo above it is being chosen: discovering that
+        "NVIDIA GPU (CUDA)" is not available here only after saving is
+        exactly the round trip this removes.
+        """
+        from .ai_explainer import hardware_text
+
+        text, tip = hardware_text(self._ai_hardware_data)
+        backend = str(self._ai_hardware_data.get("backend") or "").lower()
+        device = self._ai_device.currentData() or "auto"
+        style = "color: #8b949e;"
+
+        if backend and backend != "unknown" and device in ("cuda", "mps"):
+            if backend != device:
+                wanted = _DEVICE_LABELS.get(device, device)
+                text += (
+                    f"  — but Device is set to “{wanted}”, which this "
+                    "machine does not have. Choose Automatic or CPU only, "
+                    "or the agent will fail to load the model."
+                )
+                tip += (
+                    f"\n\n<b>Device is set to “{wanted}”</b> and nothing "
+                    "here can supply it. Saving that combination makes "
+                    "the next answer fail while loading the model."
+                )
+                style = "color: #d29922;"
+            elif device == "cpu":
+                tip += (
+                    "\n\nDevice is pinned to the CPU, so any GPU above "
+                    "will sit idle. That is a deliberate choice and it "
+                    "is the slower one."
+                )
+
+        self._ai_hardware.setText(text)
+        self._ai_hardware.setToolTip(tip)
+        self._ai_hardware.setStyleSheet(style)
 
     def _sync_agent_knobs(self, llm: dict) -> None:
         """Show the knobs the way the agent has them, not the way we stored them.

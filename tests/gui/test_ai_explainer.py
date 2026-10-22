@@ -85,14 +85,26 @@ class _StubAgent(BaseHTTPRequestHandler):
                 },
             ]}).encode()
         elif self.path == "/config":
-            body = json.dumps({"llm": {
-                "model_name": "stub-7b-instruct",
-                "max_new_tokens": 123,
-                "temperature": 0.5,
-                "device_map": "cpu",
-                "quantization": "4bit",
-                "enable_thinking": True,
-            }}).encode()
+            body = json.dumps({
+                "llm": {
+                    "model_name": "stub-7b-instruct",
+                    "max_new_tokens": 123,
+                    "temperature": 0.5,
+                    "device_map": "cpu",
+                    "quantization": "4bit",
+                    "enable_thinking": True,
+                },
+                "hardware": {
+                    "backend": "cuda",
+                    "device_name": "Stub GPU",
+                    "cuda_version": "12.4",
+                    "memory_gb": 8.0,
+                    "device_count": 1,
+                    "torch": "2.5.1",
+                    "python": "3.11.9",
+                    "cpu_cores": 12,
+                },
+            }).encode()
         else:
             body = b"{}"
         self.send_response(200)
@@ -115,6 +127,7 @@ class _StubAgent(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         received = json.loads(raw or b"{}")
         self.server.received = received                 # type: ignore[attr-defined]
+        self.server.requests += 1                       # type: ignore[attr-defined]
         body = json.dumps({
             "response": "RepetitionTime is the TR of your scan.",
             "intent": "explain",
@@ -138,6 +151,13 @@ class _Stub(NamedTuple):
         return self.server.received                   # type: ignore[attr-defined]
 
     @property
+    def requests(self) -> int:
+        """How many ``/predict`` calls have arrived — the difference
+        between "it showed me the conversation" and "it generated it
+        again", which is otherwise invisible from outside."""
+        return self.server.requests                   # type: ignore[attr-defined]
+
+    @property
     def config(self) -> dict:
         """The body of the last ``PUT /config``, as crossed the wire."""
         return self.server.config                     # type: ignore[attr-defined]
@@ -147,6 +167,7 @@ class _Stub(NamedTuple):
 def stub_agent() -> Iterator[_Stub]:
     server = HTTPServer(("127.0.0.1", 0), _StubAgent)
     server.received = {}                                # type: ignore[attr-defined]
+    server.requests = 0                                 # type: ignore[attr-defined]
     server.config = {}                                  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -385,6 +406,166 @@ class TestTheDialog:
 
 
 # =====================================================================
+# The conversation
+# =====================================================================
+
+
+# Each conversation test asks about its own complaint, so that the
+# transcript one of them writes is never the one another one reads.
+_CONVERSATION_FINDINGS = 0
+
+
+class TestTheConversation:
+    def _finding(self) -> dict:
+        """A complaint no other test has ever asked about.
+
+        The transcript is deliberately remembered for the life of the
+        process, keyed by the finding — so a shared key would hand this
+        test somebody else's turns, and "restored, so I did not
+        regenerate" would then be true for the wrong reason. Each call
+        mints a new identity; a test that needs the *same* finding twice
+        calls this once and keeps the result.
+        """
+        global _CONVERSATION_FINDINGS
+        _CONVERSATION_FINDINGS += 1
+        return build_payload(
+            severity="err",
+            message="x",
+            rule_id=f"conversation.test.{_CONVERSATION_FINDINGS}",
+            extra={"path": "sub-01/func"},
+        )
+
+    def test_every_question_and_answer_stays_on_screen(
+        self, qtbot, stub_agent,
+    ):
+        """The whole complaint: a chat that only ever shows the latest
+        message is not a chat, it is a slot being overwritten."""
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._followup.setText("What is TR?")
+        send = next(
+            b for b in dialog.findChildren(QPushButton)
+            if b.objectName() == "val-ai"
+        )
+        qtbot.mouseClick(send, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        shown = dialog._answer.toPlainText()
+        assert ai_explainer.DEFAULT_PROMPT in shown
+        assert "What is TR?" in shown
+        # Both answers, not just the one that arrived last.
+        assert shown.count("RepetitionTime is the TR") == 2
+        # In order, and attributed: that is what makes it read as an
+        # exchange rather than a wall of text.
+        first_you = shown.index("You")
+        first_agent = shown.index("AI Agent")
+        second_you = shown.index("You", first_you + 1)
+        second_agent = shown.index("AI Agent", first_agent + 1)
+        assert first_you < first_agent < second_you < second_agent
+
+    def test_the_second_question_is_sent_with_the_first(
+        self, qtbot, stub_agent,
+    ):
+        """Otherwise "And why does it matter?" is asked about nothing —
+        the model sees a bare question with no idea what came before."""
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._followup.setText("What is TR?")
+        send = next(
+            b for b in dialog.findChildren(QPushButton)
+            if b.objectName() == "val-ai"
+        )
+        qtbot.mouseClick(send, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        history = stub_agent.received.get("history")
+        assert isinstance(history, list) and history
+        assert history[0] == {
+            "role": "user",
+            "content": ai_explainer.DEFAULT_PROMPT,
+        }
+        assert history[1]["role"] == "assistant"
+        # The new question stays its own field rather than joining them.
+        assert stub_agent.received["user_input"] == "What is TR?"
+
+    def test_reopening_a_finding_restores_it_and_generates_nothing(
+        self, qtbot, stub_agent,
+    ):
+        """The second half of the complaint: coming back to an error
+        already read must not spend a minute of model time handing over
+        a *different* answer to the same question."""
+        _set(ai_base_url=stub_agent.url)
+        payload = self._finding()
+
+        first = ask(payload)
+        assert first is not None
+        qtbot.waitUntil(lambda: not first.is_busy(), timeout=10_000)
+        first.close()
+        qtbot.wait(50)
+        assert stub_agent.requests == 1
+
+        second = ask(payload)
+        assert second is not None
+        qtbot.addWidget(second)
+
+        assert second.restored()
+        assert not second.is_busy()
+        assert ai_explainer.DEFAULT_PROMPT in second._answer.toPlainText()
+        assert "RepetitionTime is the TR" in second._answer.toPlainText()
+        assert "restored" in second._status.text().lower()
+        # The one request above is still the only one.
+        assert stub_agent.requests == 1
+
+    def test_a_fresh_finding_still_generates(self, qtbot, stub_agent):
+        """Restore must not become "never asks again": a finding that
+        has not been asked about before still has to be answered."""
+        _set(ai_base_url=stub_agent.url)
+
+        dialog = ask(self._finding())
+        assert dialog is not None
+        qtbot.addWidget(dialog)
+
+        assert not dialog.restored()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert stub_agent.requests == 1
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+    def test_a_finding_that_never_got_an_answer_is_not_remembered(
+        self, qtbot, dead_url,
+    ):
+        """A failed ask leaves no half-conversation behind: the question
+        goes back into the box it came from, one Enter from a retry."""
+        _set(ai_base_url=dead_url, ai_timeout=5)
+        payload = self._finding()
+
+        first = AiExplainDialog(payload)
+        qtbot.addWidget(first)
+        first.show()
+        first.start()
+        qtbot.waitUntil(lambda: not first.is_busy(), timeout=10_000)
+        assert not first._error.isHidden()
+
+        second = AiExplainDialog(payload)
+        qtbot.addWidget(second)
+
+        assert not second.restored()
+        assert second._answer.toPlainText().strip() == ""
+        # ...and the user's typing is not what got lost: it is back in
+        # the box, one Enter from a retry.
+        assert first._followup.text() == ai_explainer.DEFAULT_PROMPT
+
+
+# =====================================================================
 # Settings
 # =====================================================================
 
@@ -542,6 +723,69 @@ class TestSettings:
         dialog._test_agent_connection()
 
         assert "Could not reach" in dialog._ai_test_result.text()
+
+    # -- what the answers will be made on ---------------------------
+
+    def test_the_hardware_row_reports_what_the_agent_can_use(
+        self, qtbot, stub_agent,
+    ):
+        """"Automatic" is not an answer on its own; this is."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._refresh_agent_models()
+        # The device the report actually describes, so the row is read
+        # in the case a user would hit it: one that matches.
+        dialog._ai_device.setCurrentIndex(
+            dialog._ai_device.findData("cuda")
+        )
+
+        text = dialog._ai_hardware.text()
+        assert "Stub GPU" in text
+        assert "CUDA 12.4" in text
+        assert "8.0 GB" in text
+        assert "2.5.1" in dialog._ai_hardware.toolTip()
+        assert "color: #d29922" not in dialog._ai_hardware.styleSheet()
+
+    def test_a_device_this_machine_cannot_serve_is_flagged_before_saving(
+        self, qtbot, stub_agent,
+    ):
+        """The round trip this removes: picking Apple GPU, saving, and
+        finding out on the next answer that it does not exist here."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._refresh_agent_models()
+        dialog._ai_device.setCurrentIndex(
+            dialog._ai_device.findData("mps")
+        )
+
+        text = dialog._ai_hardware.text()
+        assert "does not have" in text
+        assert "Apple GPU (MPS)" in text
+        assert "fail to load" in text
+        assert "color: #d29922" in dialog._ai_hardware.styleSheet()
+
+    def test_the_hardware_row_admits_when_it_does_not_know(
+        self, qtbot, dead_url,
+    ):
+        """Silence must not be read as "CPU only": that would be a
+        confident wrong answer about the machine."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        _set(ai_base_url=dead_url)
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._refresh_agent_models()
+
+        assert "Not reported yet" in dialog._ai_hardware.text()
 
 
 # =====================================================================

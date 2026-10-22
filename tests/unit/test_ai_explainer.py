@@ -25,9 +25,12 @@ from typing import Iterator
 import pytest
 
 from bidsmgr.gui.ai_explainer import (
+    HISTORY_SENT,
     AgentClient,
     AgentError,
     build_payload,
+    conversation_key,
+    hardware_text,
     plain_text,
 )
 
@@ -241,6 +244,55 @@ class TestTransport:
         with pytest.raises(AgentError, match="empty"):
             client.predict("hi", {})
 
+    def test_a_first_question_carries_no_history(self, stub_agent):
+        """Nothing to remember yet, so nothing is sent: an absent key
+        and an empty list are different things to a server that treats
+        one as "no history" and the other as "unread"."""
+        client, server = stub_agent
+        client.predict("Explain it", {"rule_id": "a.b"})
+        assert "history" not in server.received            # type: ignore[attr-defined]
+
+    def test_a_follow_up_sends_the_earlier_turns(self, stub_agent):
+        """This is what makes a follow-up a follow-up rather than a
+        second, unrelated question about the same file."""
+        client, server = stub_agent
+        history = [
+            {"role": "user", "content": "What is TR?"},
+            {"role": "assistant", "content": "RepetitionTime."},
+        ]
+
+        client.predict("And why does it matter?", {"rule_id": "a.b"},
+                       history=history)
+
+        assert server.received["history"] == history        # type: ignore[attr-defined]
+        # ...and the new question is still its own field, not folded in.
+        assert server.received["user_input"] == "And why does it matter?"
+
+    def test_a_long_transcript_is_trimmed_from_the_front(self, stub_agent):
+        """A session's worth of turns would otherwise grow the prompt
+        without bound — and the oldest turns are the least relevant."""
+        client, server = stub_agent
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant",
+             "content": f"turn {i}"}
+            for i in range(HISTORY_SENT + 5)
+        ]
+
+        client.predict("now", {"rule_id": "a.b"}, history=history)
+
+        sent = server.received["history"]                  # type: ignore[attr-defined]
+        assert len(sent) == HISTORY_SENT
+        assert sent[-1]["content"] == f"turn {HISTORY_SENT + 4}"
+        # Kept from the front of the *end*, so nothing invented appears.
+        assert all(t["content"].startswith("turn ") for t in sent)
+
+    def test_junk_in_the_transcript_never_reaches_the_wire(self, stub_agent):
+        """Non-dict entries are dropped rather than serialized as-is."""
+        client, server = stub_agent
+        client.predict("now", {"rule_id": "a.b"},
+                       history=["a string", {"role": "user"}])
+        assert "history" not in server.received            # type: ignore[attr-defined]
+
     def test_unreachable_service_says_where_to_start_it(self, dead_url):
         """Not "start it in a terminal": BIDS-Manager does that now."""
         client = AgentClient(base_url=dead_url, timeout=3.0)
@@ -383,6 +435,108 @@ class TestPushingConfig:
         error = mod.push_llm_config(AppSettings())
         assert error                      # returned, not raised
         assert "Could not reach" in error
+
+
+# =====================================================================
+# Which conversation a question belongs to
+# =====================================================================
+
+
+class TestConversationIdentity:
+    def test_the_same_finding_is_the_same_conversation(self):
+        """Reopening an error has to find what was said about it, and
+        the message being reworded between runs must not lose it."""
+        first = build_payload(
+            severity="err",
+            message="<code>RepetitionTime</code> is required.",
+            rule_id="entity.required",
+            extra={"path": "sub-01/func"},
+        )
+        second = build_payload(
+            severity="err",
+            message="RepetitionTime is required for this file.",
+            rule_id="entity.required",
+            extra={"path": "sub-01/func"},
+        )
+        assert conversation_key(first) == conversation_key(second)
+
+    def test_another_file_is_another_conversation(self):
+        one = build_payload(severity="err", message="x",
+                            rule_id="a.b", extra={"path": "sub-01/func"})
+        two = build_payload(severity="err", message="x",
+                            rule_id="a.b", extra={"path": "sub-01/anat"})
+        assert conversation_key(one) != conversation_key(two)
+
+    def test_another_rule_is_another_conversation(self):
+        one = build_payload(severity="err", message="x", rule_id="a.b")
+        two = build_payload(severity="err", message="x", rule_id="a.c")
+        assert conversation_key(one) != conversation_key(two)
+
+    def test_a_finding_with_nothing_to_identify_it_by_still_gets_a_key(self):
+        """A coherence warning carries no rule id and sometimes no path.
+        The digest is what is left — and two different ones must not
+        land in the same transcript."""
+        vague = build_payload(severity="warn", message="Files disagree.")
+        other = build_payload(severity="warn", message="Something else.")
+        assert conversation_key(vague) == conversation_key(
+            build_payload(severity="warn", message="Files disagree.")
+        )
+        assert conversation_key(vague) != conversation_key(other)
+        assert conversation_key(vague)
+
+
+# =====================================================================
+# What the hardware row says
+# =====================================================================
+
+
+class TestSayingWhatTheAnswersAreMadeOn:
+    def test_no_report_yet_is_not_read_as_a_machine_with_no_gpu(self):
+        """Silence is not an answer: guessing "CPU" from an agent that
+        has not spoken would be a confident wrong one."""
+        for silent in ({}, None, {"backend": ""}):
+            text, tip = hardware_text(silent)
+            assert "Not reported yet" in text
+            assert "CPU only" not in text
+            assert "Test connection" in tip
+
+    def test_an_nvidia_card_is_named_with_its_memory(self):
+        text, tip = hardware_text({
+            "backend": "cuda",
+            "device_name": "NVIDIA GeForce RTX 3060",
+            "cuda_version": "12.1",
+            "memory_gb": 12.0,
+            "device_count": 1,
+            "torch": "2.5.1",
+            "python": "3.10.9",
+        })
+        assert "NVIDIA GeForce RTX 3060" in text
+        assert "CUDA 12.1" in text
+        assert "12.0 GB" in text
+        # One card is not worth announcing as "1 cards".
+        assert "cards" not in text
+        assert "2.5.1" in tip
+
+    def test_more_than_one_card_is_counted(self):
+        text, _ = hardware_text({"backend": "cuda",
+                                 "device_name": "GPU", "device_count": 2})
+        assert "2 cards" in text
+
+    def test_apple_silicon_is_recognised(self):
+        text, _ = hardware_text({"backend": "mps",
+                                 "device_name": "Apple GPU"})
+        assert "MPS" in text
+        assert "CUDA" not in text
+
+    def test_cpu_only_says_so_and_that_it_is_the_slow_one(self):
+        text, tip = hardware_text({"backend": "cpu", "cpu_cores": 8})
+        assert "CPU only" in text
+        assert "8 cores" in text
+        assert "slower" in tip.lower()
+
+    def test_an_unrecognised_backend_is_reported_not_translated(self):
+        text, _ = hardware_text({"backend": "tpu", "device_name": "Thing"})
+        assert "Thing" in text
 
 
 # =====================================================================
