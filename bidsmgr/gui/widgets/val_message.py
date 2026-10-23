@@ -114,6 +114,9 @@ class ValMessage(QFrame):
     # decided to keep it. Never offered on an error: a tool that lets you
     # dismiss wrongness produces broken datasets quietly.
     accept_requested = pyqtSignal(str, str)   # (rule_id, field)
+    # The "show me" button: open the evidence for this finding (the image
+    # header for a header finding). Carries the rule id.
+    view_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -125,6 +128,7 @@ class ValMessage(QFrame):
         schema_rule: Optional[str] = None,
         context: Optional[dict] = None,
         parent=None,
+        view_label: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName(_OBJECT_NAME_BY_SEVERITY.get(severity, "val-msg"))
@@ -176,6 +180,12 @@ class ValMessage(QFrame):
                 lambda: self.fix_requested.emit(self._field_name)
             )
             head.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        if view_label:
+            view = QPushButton(view_label)
+            view.setObjectName("val-fix")
+            view.setToolTip("Open the image with the evidence for this finding")
+            view.clicked.connect(lambda: self.view_requested.emit(self._rule_id))
+            head.addWidget(view, 0, Qt.AlignmentFlag.AlignVCenter)
         ai_btn = self._ai_button()
         if ai_btn is not None:
             head.addWidget(ai_btn, 0, Qt.AlignmentFlag.AlignVCenter)

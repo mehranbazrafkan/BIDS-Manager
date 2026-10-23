@@ -24,7 +24,14 @@ from PyQt6.QtCore import QSettings
 # Canonical setting keys. Grouped by section as a flat string namespace
 # so QSettings shows them under ``[section]`` headers in INI / plist.
 KEYS = {
-    "theme":              "ui/theme",                # "dark" | "light"
+    "theme":              "ui/theme",                # a theme_manager.THEMES id
+    # The user's touches on any theme (gui/appearance.py).
+    "log_clear_on_run":   "ui/log_clear_on_run",
+    "accent":             "ui/accent",               # "" | preset | "custom"
+    "custom_accent":      "ui/custom_accent",        # JSON: {"dark"|"light": "#rrggbb"}
+    "tint":               "ui/tint",                 # 0..12 percent
+    "icon_style":         "ui/icon_style",           # monochrome|accent|colourful
+    "tree_colours":       "ui/tree_colours",         # JSON: kind -> {"dark"|"light": hex}
     "raw_root":           "paths/raw_root",          # last raw input dir
     "bids_parent":        "paths/bids_parent",       # last BIDS output dir
     "scan_tsv_filename":  "scan/tsv_filename",       # filename of the scan TSV
@@ -42,23 +49,19 @@ KEYS = {
     "validate_max_rows": "validate/max_rows",              # TSV rows scanned per table
     "validate_show": "validate/show",                      # which severities the Editor lists
     "validate_flag_todos": "validate/flag_todos",          # flag literal TODO placeholders
-    # Which of the four viewer layouts to open a scan in. "" means the user
-    # has never chosen, so the GPU-dependent default applies.
-    "nifti_view_mode": "editor/nifti_view_mode",                # single|multi|3d|combo
-    "nifti_orientation": "editor/nifti_orientation",           # 0 sag | 1 cor | 2 ax
     # How every signal viewer draws a trace. One preference, not one per
     # viewer: somebody who wants thicker lines wants them everywhere.
-    "trace_line_width": "editor/trace_line_width",
-    "trace_line_color": "editor/trace_line_color",
-    "trace_type_colors": "editor/trace_type_colors",   # JSON, channel type -> hex
-    "nifti_crosshair_color": "editor/nifti_crosshair_color",   # hex string e.g. "#4FC3F7"
-    "nifti_crosshair_thickness": "editor/nifti_crosshair_thickness",  # px, 1..5
+    # Every viewer preference of the visualisation library, one JSON value
+    # (``bidsmgr.viz.settings.VizSettings``): crosshair, defaults, keymap,
+    # mouse map, layout sizes. See ``gui/viz/settings_store.py``.
+    "viz_settings": "viz/settings",
     # Scan defaults
     "scan_n_jobs":        "scan/n_jobs",
     "scan_probe_convert": "scan/probe_convert",
     "scan_converter_preview": "scan/converter_preview",
     "scan_skip_bids_guess": "scan/skip_bids_guess",
     "scan_index_widths":  "scan/index_widths",       # JSON: entity -> width
+    "scan_drop_entities": "scan/drop_entities",      # JSON: [short entity key]
     # Convert defaults
     "convert_n_jobs":     "convert/n_jobs",
     "convert_overwrite":  "convert/overwrite",      # legacy; migrated to on_existing
@@ -68,6 +71,12 @@ KEYS = {
     "convert_force_edf":  "convert/force_edf",       # re-encode EEG/iEEG to EDF
     "convert_deface":     "convert/deface",          # remove faces before commit
     "convert_deface_engine": "convert/deface_engine",
+    "convert_intended_for": "convert/intended_for",
+    "convert_b0_field":   "convert/b0_field",
+    "convert_sourcedata": "convert/sourcedata",      # none|copy|archive
+    # The parameter-based classifier's settings, as JSON (its own model).
+    "classifier_config":  "classifier/acquisition",
+    "convert_sourcedata_modalities": "convert/sourcedata_modalities",  # comma list
     # Scan rules (user-extensible classifier hints + series exclusions).
     # Stored as JSON-encoded lists - see ``bidsmgr.classifier.user_rules``.
     "user_hints":         "classifier/user_hints",
@@ -76,11 +85,14 @@ KEYS = {
     "post_run_metadata":  "post_convert/run_metadata",
     "post_run_validate":  "post_convert/run_validate",
     "post_metadata_fill_todos": "post_convert/metadata_fill_todos",
+    "post_metadata_tables": "post_convert/metadata_tables",
+    "post_anonymise":     "post_convert/anonymise",          # off|recommended|strict
     "metadata_fill_scope": "post_convert/metadata_fill_scope",
     "post_validate_strict": "post_convert/validate_strict",
     "post_validate_html": "post_convert/validate_html",
     "post_fixup_companions": "post_convert/fixup_companions",
     "post_fixup_citation": "post_convert/fixup_citation",
+    "post_run_quality":   "post_convert/run_quality",
     # Self-update
     "skipped_update_version": "update/skipped_version",
     # UI font scale (1.0 = default size baseline; values <1 shrink,
@@ -90,6 +102,15 @@ KEYS = {
     # "default" → ``assets/logo.png`` (monochrome, palette-inverted on dark).
     # "app_icon" → ``assets/macos/AppIcon128.png`` (full-color BIDS-Manager logo).
     "header_logo": "ui/header_logo",
+    # The release whose "What's new" dialog was last shown (``whats_new.NEWS_FOR``,
+    # e.g. "1.5"). Not a setting the user sees: it keeps the dialog to once.
+    "whats_new_seen": "ui/whats_new_seen",
+    # Now and then, ask for a star on GitHub (gui/star_request.py). The switch
+    # is in Settings > Display and in the dialog ("Don't ask me again").
+    "ask_for_star": "ui/ask_for_star",
+    # When to ask: not settings the user sees (``star_request.StarSchedule``).
+    "star_last_asked": "ui/star_last_asked",
+    "star_opened": "ui/star_opened",
     # Recently opened/created project dataset roots (JSON list, most-recent
     # first), shown on the Welcome tab.
     "recent_projects": "project/recent",
@@ -127,6 +148,16 @@ class AppSettings:
 
     # UI
     theme: str = "dark"
+    # Appearance on top of the theme (gui/appearance.Appearance).
+    #: Empty the Converter's Log when a scan or a conversion starts.
+    log_clear_on_run: bool = True
+    #: Now and then, ask for a star on GitHub (gui/star_request.py).
+    ask_for_star: bool = True
+    accent: str = ""
+    custom_accent: dict = field(default_factory=dict)
+    tint: int = 0
+    icon_style: str = "monochrome"
+    tree_colours: dict = field(default_factory=dict)
     # Which top-level view is shown on launch. Persisted across runs so
     # users land on the pane they were last using.
     active_view: str = "converter"
@@ -146,12 +177,12 @@ class AppSettings:
     # was actually wanted was for the toolbar to SAY there are unsaved
     # changes from the first keystroke, which it now does regardless of this.
     editor_autosave: bool = False
-    # "Deep checks" toggle for the Editor's "Validate dataset". When True the
-    # validator (bidsval) reads NIfTI headers and file contents (slower, more
-    # thorough); when False it runs the fast structural pass used for live
-    # revalidation. (Historically this enabled a second bidsschematools pass;
-    # validation is now a single engine and the toggle maps to read_headers.)
-    editor_strict_validate: bool = False
+    # The Editor's "Deep checks" toggle, for Validate dataset, folder and file
+    # alike: the validator also reads the NIfTI headers and file contents
+    # (the toggle maps to read_headers). ON by default: the audit measured it
+    # at about 5 percent of a validation, and without it seven header defects
+    # (repetition time, volume count, a 4-D T1w...) were never reported.
+    editor_strict_validate: bool = True
     # Validation engine (bidsval) knobs. ``validate_schema_version`` selects the
     # BIDS schema version to validate against ("" = bidsval's bundled default);
     # ``validate_max_rows`` bounds how many rows of each TSV are scanned;
@@ -169,26 +200,6 @@ class AppSettings:
     # Empty on purpose: "no choice made yet" is a different thing from any
     # particular layout, and it is what lets the first run pick the best
     # default this machine can show rather than a stored one.
-    # How a trace is drawn in the signal viewers. ZERO means "decide from
-    # what is on screen": two pixels for a physio channel, one for a wall of
-    # MEG, because Qt strokes a wider pen 7x slower and a 300-channel view
-    # cannot pay it. A width the user picks in the Line popup is stored as
-    # that number and honoured everywhere.
-    trace_line_width: int = 0
-    trace_line_color: str = ""
-    # Per-channel-type trace colours, type -> hex. EMPTY is the shipped
-    # scheme, which is palette TOKENS rather than literals (mag takes the
-    # accent colour, grad the success colour) so it follows the theme and
-    # stays legible in both. A type appears here only when somebody chose
-    # a colour for it, which is what lets Reset defaults be a deletion
-    # rather than a second hardcoded table to keep in step.
-    trace_type_colors: dict = field(default_factory=dict)
-    nifti_view_mode: str = ""
-    # Which plane a single-pane view opens on. Axial by convention when the
-    # user has never chosen.
-    nifti_orientation: int = 2
-    nifti_crosshair_color: str = "#4FC3F7"
-    nifti_crosshair_thickness: int = 1
     # Colour the requirement-level marks in the metadata template. Off, the
     # marks (* required, . recommended) remain, so the information does not
     # depend on being able to see the colour.
@@ -215,6 +226,10 @@ class AppSettings:
     # because QSettings has no dict type and a flat key per entity would need
     # editing here every time BIDS adds one.
     scan_index_widths: dict = field(default_factory=dict)
+    # Entities left out of the names a scan proposes, as short keys
+    # (``["acq"]``), where the standard does not require them and they do not
+    # tell two recordings apart (``inventory.leave_out``). Empty: none.
+    scan_drop_entities: list = field(default_factory=list)
     # Record what the conversion answers by itself, so the metadata form
     # shows it instead of an empty box for a field nobody has to fill in.
     scan_converter_preview: bool = True
@@ -241,6 +256,19 @@ class AppSettings:
     # discovered after the fact.
     convert_deface: bool = False
     convert_deface_engine: str = "allineate"
+    # How a fieldmap names its runs: "uri" (BIDS URIs) or "relative" (paths
+    # from the subject, with the session); and whether to write
+    # B0FieldIdentifier / B0FieldSource too (read by every fMRIPrep).
+    convert_intended_for: str = "uri"
+    convert_b0_field: bool = True
+    # Keep each subject's source data in sourcedata/: "none", "copy" or
+    # "archive" (one .tar.gz per series), for these modalities (comma list).
+    # Off by default: the copies are not anonymised.
+    convert_sourcedata: str = "none"
+    # The parameter-based classifier (classifier/acquisition/config.py), as
+    # its JSON; "" is the defaults. Read through ``classifier()``.
+    classifier_config: str = ""
+    convert_sourcedata_modalities: str = "mri,pet,eeg,meg,nirs,physio,eyetrack"
 
     # Post-convert chain. All steps on by default: run metadata + validation
     # with TODO placeholders, strict validation, and an HTML report.
@@ -260,6 +288,18 @@ class AppSettings:
     # output cannot be trusted.
     post_fixup_companions: bool = False
     post_fixup_citation: bool = False
+    # The *_scans.tsv and *_sessions.tsv tables, in the metadata step. ON:
+    # the standard makes both optional, but they are where a dataset says
+    # when each recording and session was acquired.
+    post_metadata_tables: bool = True
+    # Anonymise the dataset's metadata after every conversion
+    # (``bidsmgr.anonymise``): "off", "recommended" or "strict". OFF by
+    # default: it shifts every date, which a user must choose knowingly.
+    post_anonymise: str = "off"
+    # The fast quality check of the anatomical and diffusion images
+    # (bidsmgr.qc), last. OFF by default: seconds per image, minutes for a
+    # study, and its results are a derivative the user should ask for.
+    post_run_quality: bool = False
 
     # PyPI version string the user picked "Skip this version" on, so the
     # startup update check doesn't nag them about the same release on
@@ -272,9 +312,9 @@ class AppSettings:
     font_scale: float = 1.0
 
     # Header brand artwork.
-    # "default"  → minimalist mark in ``assets/logo.png``, inverted on dark.
-    # "app_icon" → full-color BIDS-Manager app icon (``assets/macos/AppIcon128.png``).
-    header_logo: str = "default"
+    # "app_icon" → the full-colour BIDS Manager app icon (``assets/macos/``), the default.
+    # "mark"     → the monochrome mark in ``assets/logo.png``, inverted on dark.
+    header_logo: str = "app_icon"
 
     # Scan rules (JSON-serialisable list[dict]); converted to/from the
     # engine's frozen dataclasses at the boundary via ``to_user_hints`` /
@@ -323,6 +363,14 @@ class AppSettings:
         """
         return QSettings()
 
+    def appearance(self):
+        """The accent, tint, icon style and tree colours, as one value."""
+        from .appearance import Appearance
+
+        return Appearance(accent=self.accent, custom_accent=dict(self.custom_accent),
+                          tint=self.tint, icons=self.icon_style,
+                          tree=dict(self.tree_colours)).normalised()
+
     @classmethod
     def load(cls) -> "AppSettings":
         s = cls._settings()
@@ -361,8 +409,25 @@ class AppSettings:
             return out if isinstance(out, list) else list(default)
 
         out.theme = _as_str(s.value(KEYS["theme"]), out.theme)
-        if out.theme not in ("dark", "light"):
+        from .theme_manager import PALETTES
+
+        if out.theme not in PALETTES:
             out.theme = "dark"
+        out.accent = _as_str(s.value(KEYS["accent"]), out.accent)
+        out.tint = _as_int(s.value(KEYS["tint"]), out.tint)
+        out.icon_style = _as_str(s.value(KEYS["icon_style"]), out.icon_style)
+        for attr in ("custom_accent", "tree_colours"):
+            try:
+                raw = s.value(KEYS[attr], "")
+                parsed = json.loads(raw) if raw else {}
+                setattr(out, attr, dict(parsed) if isinstance(parsed, dict) else {})
+            except (TypeError, ValueError):
+                setattr(out, attr, {})
+        # A hand-edited value cannot stop the app opening.
+        look = out.appearance()
+        out.accent, out.custom_accent, out.tint, out.icon_style, out.tree_colours = (
+            look.accent, dict(look.custom_accent), look.tint, look.icons,
+            {k: dict(v) for k, v in look.tree.items()})
         out.active_view = _as_str(s.value(KEYS["active_view"]), out.active_view)
         if out.active_view not in ("converter", "editor"):
             out.active_view = "converter"
@@ -383,6 +448,9 @@ class AppSettings:
         out.editor_autosave = _as_bool(
             s.value(KEYS["editor_autosave"]), out.editor_autosave,
         )
+        out.log_clear_on_run = _as_bool(s.value(KEYS["log_clear_on_run"]),
+                                        out.log_clear_on_run)
+        out.ask_for_star = _as_bool(s.value(KEYS["ask_for_star"]), out.ask_for_star)
         out.editor_strict_validate = _as_bool(
             s.value(KEYS["editor_strict_validate"]),
             out.editor_strict_validate,
@@ -403,51 +471,6 @@ class AppSettings:
             out.validate_show = "error_warning"
         out.validate_flag_todos = _as_bool(
             s.value(KEYS["validate_flag_todos"]), out.validate_flag_todos,
-        )
-        try:
-            out.trace_line_width = int(
-                s.value(KEYS["trace_line_width"], out.trace_line_width)
-            )
-        except (TypeError, ValueError):
-            pass
-        # 0 is legal and means automatic; anything outside 1..8 is not.
-        if out.trace_line_width and not (1 <= out.trace_line_width <= 8):
-            out.trace_line_width = 0
-        out.trace_line_color = _as_str(
-            s.value(KEYS["trace_line_color"]), out.trace_line_color,
-        )
-        try:
-            raw = s.value(KEYS["trace_type_colors"], "")
-            parsed = json.loads(raw) if isinstance(raw, str) and raw else {}
-            if isinstance(parsed, dict):
-                out.trace_type_colors = {
-                    str(k): str(v) for k, v in parsed.items() if v
-                }
-        except (TypeError, ValueError):
-            pass
-        out.nifti_view_mode = _as_str(
-            s.value(KEYS["nifti_view_mode"]), out.nifti_view_mode,
-        )
-        if out.nifti_view_mode not in ("", "single", "multi", "3d", "combo"):
-            out.nifti_view_mode = ""
-        try:
-            out.nifti_orientation = int(
-                s.value(KEYS["nifti_orientation"], out.nifti_orientation)
-            )
-        except (TypeError, ValueError):
-            pass
-        if out.nifti_orientation not in (0, 1, 2):
-            out.nifti_orientation = 2
-        out.nifti_crosshair_color = _as_str(
-            s.value(KEYS["nifti_crosshair_color"]),
-            out.nifti_crosshair_color,
-        )
-        out.nifti_crosshair_thickness = _as_int(
-            s.value(KEYS["nifti_crosshair_thickness"]),
-            out.nifti_crosshair_thickness,
-        )
-        out.nifti_crosshair_thickness = max(
-            1, min(out.nifti_crosshair_thickness, 5),
         )
         out.template_colour_levels = _as_bool(
             s.value(KEYS["template_colour_levels"]),
@@ -474,6 +497,16 @@ class AppSettings:
             } if isinstance(parsed, dict) else {}
         except (TypeError, ValueError):
             out.scan_index_widths = {}
+        try:
+            from ..inventory.leave_out import offered
+
+            raw = s.value(KEYS["scan_drop_entities"], "")
+            parsed = json.loads(raw) if raw else []
+            out.scan_drop_entities = [
+                str(k) for k in parsed if str(k) in offered()
+            ] if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            out.scan_drop_entities = []
         out.scan_converter_preview = _as_bool(
             s.value(KEYS["scan_converter_preview"]), out.scan_converter_preview,
         )
@@ -515,6 +548,25 @@ class AppSettings:
 
         if out.convert_deface_engine not in _deface_engine_ids():
             out.convert_deface_engine = cls.convert_deface_engine
+        out.convert_intended_for = str(s.value(KEYS["convert_intended_for"])
+                                       or out.convert_intended_for)
+        if out.convert_intended_for not in ("uri", "relative"):
+            out.convert_intended_for = "uri"
+        out.convert_b0_field = _as_bool(s.value(KEYS["convert_b0_field"]),
+                                        out.convert_b0_field)
+        out.classifier_config = str(s.value(KEYS["classifier_config"]) or "")
+        from ..converter.sourcedata import FORMS as _SD_FORMS
+        from ..converter.sourcedata import MODALITIES as _SD_MODALITIES
+
+        out.convert_sourcedata = str(s.value(KEYS["convert_sourcedata"])
+                                     or out.convert_sourcedata)
+        if out.convert_sourcedata not in _SD_FORMS:
+            out.convert_sourcedata = cls.convert_sourcedata
+        raw = s.value(KEYS["convert_sourcedata_modalities"])
+        if raw is not None:
+            # Stored as a comma list; an unknown name (a later version's) is dropped.
+            out.convert_sourcedata_modalities = ",".join(
+                m for m in str(raw).split(",") if m.strip() in _SD_MODALITIES)
 
         out.post_run_metadata = _as_bool(s.value(KEYS["post_run_metadata"]),
                                          out.post_run_metadata)
@@ -536,9 +588,17 @@ class AppSettings:
         out.post_fixup_companions = _as_bool(
             s.value(KEYS["post_fixup_companions"]), out.post_fixup_companions,
         )
+        out.post_run_quality = _as_bool(s.value(KEYS["post_run_quality"]),
+                                        out.post_run_quality)
         out.post_fixup_citation = _as_bool(
             s.value(KEYS["post_fixup_citation"]), out.post_fixup_citation,
         )
+        out.post_metadata_tables = _as_bool(
+            s.value(KEYS["post_metadata_tables"]), out.post_metadata_tables,
+        )
+        anonymise = _as_str(s.value(KEYS["post_anonymise"]), out.post_anonymise)
+        out.post_anonymise = anonymise if anonymise in ("off", "recommended",
+                                                        "strict") else "off"
         out.skipped_update_version = _as_str(
             s.value(KEYS["skipped_update_version"]),
             out.skipped_update_version,
@@ -552,8 +612,8 @@ class AppSettings:
         out.header_logo = _as_str(
             s.value(KEYS["header_logo"]), out.header_logo,
         )
-        if out.header_logo not in ("default", "app_icon"):
-            out.header_logo = "default"
+        if out.header_logo not in ("app_icon", "mark"):
+            out.header_logo = "app_icon"
         out.user_hints = _as_json_list(s.value(KEYS["user_hints"]), [])
         out.scan_exclusions = _as_json_list(s.value(KEYS["scan_exclusions"]), [])
         out.recent_projects = _as_json_list(s.value(KEYS["recent_projects"]), [])
@@ -602,10 +662,37 @@ class AppSettings:
             out.ai_temperature = 0.75
         return out
 
+    def placeholder_scope(self) -> str:
+        """Which fields the metadata step leaves a TODO in: the one value the
+        checkbox and the scope beside it amount to.
+
+        Read here, once, because reading them separately is how the chain
+        marked fields with the checkbox off: the scope alone switched it on.
+        Off is ``"none"``, which also takes back placeholders a run with it on
+        wrote, so the dataset carries what the setting says.
+        """
+        return self.metadata_fill_scope if self.post_metadata_fill_todos else "none"
+
+    def classifier(self):
+        """The parameter-based classifier's settings (defaults when unset or
+        unreadable)."""
+        from ..classifier.acquisition.config import ClassifierConfig, load_json
+
+        try:
+            return load_json(self.classifier_config) if self.classifier_config else \
+                ClassifierConfig()
+        except ValueError:
+            return ClassifierConfig()
+
     def save(self) -> None:
         s = self._settings()
         # Strings.
         s.setValue(KEYS["theme"], self.theme)
+        s.setValue(KEYS["accent"], self.accent)
+        s.setValue(KEYS["custom_accent"], json.dumps(self.custom_accent))
+        s.setValue(KEYS["tint"], int(self.tint))
+        s.setValue(KEYS["icon_style"], self.icon_style)
+        s.setValue(KEYS["tree_colours"], json.dumps(self.tree_colours))
         s.setValue(KEYS["scan_tsv_filename"], self.scan_tsv_filename)
         s.setValue(KEYS["editor_field_scope"], self.editor_field_scope)
         if self.raw_root is not None:
@@ -626,18 +713,22 @@ class AppSettings:
             ("convert_preserve_curation", self.convert_preserve_curation),
             ("convert_force_edf",        self.convert_force_edf),
             ("convert_deface",           self.convert_deface),
+            ("convert_b0_field",         self.convert_b0_field),
             ("post_run_metadata",        self.post_run_metadata),
             ("post_run_validate",        self.post_run_validate),
             ("post_metadata_fill_todos", self.post_metadata_fill_todos),
-            ("metadata_fill_scope",      self.metadata_fill_scope),
             ("post_validate_strict",     self.post_validate_strict),
             ("post_validate_html",       self.post_validate_html),
             ("post_fixup_companions",    self.post_fixup_companions),
             ("post_fixup_citation",      self.post_fixup_citation),
+            ("post_metadata_tables",     self.post_metadata_tables),
+            ("post_run_quality",         self.post_run_quality),
             ("editor_strict_validate",   self.editor_strict_validate),
             ("validate_flag_todos",      self.validate_flag_todos),
             ("editor_show_hidden",       self.editor_show_hidden),
             ("editor_autosave",          self.editor_autosave),
+            ("log_clear_on_run",         self.log_clear_on_run),
+            ("ask_for_star",             self.ask_for_star),
             ("ai_enabled",               self.ai_enabled),
             ("ai_enable_thinking",       self.ai_enable_thinking),
         ):
@@ -648,13 +739,17 @@ class AppSettings:
         # that list, every conversion loaded the engine id "1", and the lookup
         # raised inside the subject commit, so nothing converted at all.
         s.setValue(KEYS["convert_on_existing"], self.convert_on_existing)
+        # Was in the bool loop above, so every scope was saved as "1" and read
+        # back as the default: choosing "Required fields only" never stuck.
+        s.setValue(KEYS["metadata_fill_scope"], self.metadata_fill_scope)
         s.setValue(KEYS["convert_deface_engine"], self.convert_deface_engine)
-        s.setValue(KEYS["trace_line_width"], int(self.trace_line_width))
-        s.setValue(KEYS["trace_line_color"], self.trace_line_color)
-        s.setValue(KEYS["trace_type_colors"], json.dumps(self.trace_type_colors))
-        s.setValue(KEYS["nifti_view_mode"], self.nifti_view_mode)
+        s.setValue(KEYS["convert_intended_for"], self.convert_intended_for)
+        s.setValue(KEYS["post_anonymise"], self.post_anonymise)
+        s.setValue(KEYS["convert_sourcedata"], self.convert_sourcedata)
+        s.setValue(KEYS["classifier_config"], self.classifier_config)
+        s.setValue(KEYS["convert_sourcedata_modalities"], self.convert_sourcedata_modalities)
         s.setValue(KEYS["scan_index_widths"], json.dumps(self.scan_index_widths))
-        s.setValue(KEYS["nifti_orientation"], int(self.nifti_orientation))
+        s.setValue(KEYS["scan_drop_entities"], json.dumps(list(self.scan_drop_entities)))
         s.setValue(KEYS["validate_schema_version"], self.validate_schema_version)
         s.setValue(KEYS["validate_max_rows"], int(self.validate_max_rows))
         s.setValue(KEYS["validate_show"], self.validate_show)
@@ -723,6 +818,34 @@ class AppSettings:
         s.setValue(KEYS["recent_projects"], json.dumps(out))
 
     @classmethod
+    def whats_new_seen(cls) -> str:
+        """The release whose "What's new" dialog was last shown ("" if never)."""
+        value = cls._settings().value(KEYS["whats_new_seen"])
+        return str(value) if value is not None else ""
+
+    @classmethod
+    def remember_whats_new_seen(cls, release: str) -> None:
+        cls._settings().setValue(KEYS["whats_new_seen"], release)
+
+    @classmethod
+    def remember_ask_for_star(cls, ask: bool) -> None:
+        cls._settings().setValue(KEYS["ask_for_star"], "1" if ask else "0")
+
+    @classmethod
+    def star_schedule(cls) -> dict:
+        """What decides when to ask for a star (``star_request.StarSchedule``)."""
+        s = cls._settings()
+        last, opened = s.value(KEYS["star_last_asked"]), s.value(KEYS["star_opened"])
+        return {"last_asked": str(last) if last is not None else "",
+                "opened": str(opened or "").lower() in ("1", "true")}
+
+    @classmethod
+    def remember_star_schedule(cls, *, last_asked: str, opened: bool) -> None:
+        s = cls._settings()
+        s.setValue(KEYS["star_last_asked"], last_asked)
+        s.setValue(KEYS["star_opened"], "1" if opened else "0")
+
+    @classmethod
     def remember_theme(cls, theme: str) -> None:
         cls._settings().setValue(KEYS["theme"], theme)
 
@@ -769,48 +892,6 @@ class AppSettings:
         from ..classifier import user_rules
         _, excl = user_rules.from_json({"scan_exclusions": self.scan_exclusions})
         return excl
-
-    @classmethod
-    def remember_trace_style(cls, width: int, colour: str) -> None:
-        """Store how a trace is drawn. One preference for every viewer."""
-        cls._settings().setValue(KEYS["trace_line_width"], int(width))
-        cls._settings().setValue(KEYS["trace_line_color"], str(colour))
-
-    @classmethod
-    def remember_type_colors(cls, mapping: dict) -> None:
-        """Store per-channel-type trace colours. Empty restores the defaults."""
-        clean = {str(k): str(v) for k, v in dict(mapping or {}).items() if v}
-        cls._settings().setValue(
-            KEYS["trace_type_colors"], json.dumps(clean),
-        )
-
-    @classmethod
-    def remember_nifti_view_mode(cls, mode: str) -> None:
-        """Store the layout the user is in, so the next scan opens in it.
-
-        Written as the user switches rather than at shut-down: the Editor is
-        not always closed cleanly, and a preference that only survives a
-        graceful exit is one that mostly does not survive.
-        """
-        if mode not in ("single", "multi", "3d", "combo"):
-            return
-        cls._settings().setValue(KEYS["nifti_view_mode"], str(mode))
-
-    @classmethod
-    def remember_nifti_orientation(cls, axis: int) -> None:
-        """Store the plane, so a single-pane view opens on the same one."""
-        if int(axis) not in (0, 1, 2):
-            return
-        cls._settings().setValue(KEYS["nifti_orientation"], int(axis))
-
-    @classmethod
-    def remember_nifti_crosshair(cls, color: str, thickness: int) -> None:
-        s = cls._settings()
-        s.setValue(KEYS["nifti_crosshair_color"], str(color))
-        s.setValue(
-            KEYS["nifti_crosshair_thickness"],
-            int(max(1, min(thickness, 5))),
-        )
 
 
 __all__ = ["AppSettings", "KEYS"]

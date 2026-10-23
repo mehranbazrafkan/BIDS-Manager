@@ -96,20 +96,34 @@ def test_every_string_setting_round_trips_a_non_boolish_value():
     """Generic guard: any string field put in the bool loop fails here."""
     # A field whose load path validates against a vocabulary needs a value
     # from that vocabulary, or the round trip legitimately rejects the probe
-    # and the test measures the guard instead of the save.
+    # and the test measures the guard instead of the save. And the value must
+    # NOT be the default: a field saved as "1" is read back as its default, so
+    # probing with the default passed while metadata_fill_scope never stuck.
     constrained = {
-        "nifti_view_mode": "combo",
+        "nifti_view_mode": "combo", "accent": "teal", "theme": "light",
+        "icon_style": "accent",
         # Vocabularies app_settings validates against on load; anything
         # outside them is reset to the default by design.
         "ai_device_map": "cpu",
         "ai_quantization": "4bit",
+        "editor_field_scope": "present",
+        "validate_show": "error", "scan_tsv_filename": "study.tsv",
+        "convert_on_existing": "update", "convert_intended_for": "relative",
+        "convert_sourcedata": "copy", "convert_sourcedata_modalities": "mri,eeg",
+        "metadata_fill_scope": "optional", "header_logo": "mark",
+        "convert_deface_engine": "allineate-robust",
+        "post_anonymise": "strict",
     }
     probes = {
         str: "allineate-robust",
     }
+    # Written only by their remember_* calls when the view switches, so a Settings
+    # dialog saving a copy it loaded earlier cannot switch the view back.
+    remembered_elsewhere = {"active_view", "editor_sidecar_view"}
     fields = [
         f for f in dataclasses.fields(AppSettings)
         if f.type in (str, "str") and f.name in KEYS
+        and f.name not in remembered_elsewhere
     ]
     assert fields, "no string settings found; the introspection broke"
 
@@ -119,6 +133,10 @@ def test_every_string_setting_round_trips_a_non_boolish_value():
         # Use the field's own default when it is a constrained vocabulary;
         # a free-form field gets a value no bool encoder could produce.
         probe = constrained.get(field.name) or current or probes[str]
+        assert probe != current, (
+            f"{field.name}: probe with a value other than the default "
+            f"{current!r}, or a field flattened to '1' still passes"
+        )
         setattr(s, field.name, probe)
         after = _round_trip(s)
         assert getattr(after, field.name) == probe, (
@@ -161,3 +179,17 @@ def test_a_nonsense_width_is_dropped_on_load(tmp_path, monkeypatch):
     back = AppSettings.load()
     assert "run" not in back.scan_index_widths
     assert back.scan_index_widths.get("echo") == 2
+
+
+def test_the_colour_app_icon_is_the_default_header_logo(isolated_settings):
+    assert AppSettings().header_logo == "app_icon"
+    assert AppSettings.load().header_logo == "app_icon"
+    store = QSettings(str(isolated_settings), QSettings.Format.IniFormat)
+    # Earlier versions stored "default" for the monochrome mark they showed by
+    # default; it is not a value any more, so it reads as the new default.
+    store.setValue(KEYS["header_logo"], "default")
+    store.sync()
+    assert AppSettings.load().header_logo == "app_icon"
+    store.setValue(KEYS["header_logo"], "mark")
+    store.sync()
+    assert AppSettings.load().header_logo == "mark"

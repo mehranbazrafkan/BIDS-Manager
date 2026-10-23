@@ -59,10 +59,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ...editor.bidsmgr_checks import value_kind
 from ...editor.types import FieldLevel, FileVerdict, SidecarField
 from .flow_layout import flow
 from .json_tree_view import JsonTreeView
 from .primitives import ElidedLabel, PaneHeader
+from .search_field import SearchField, find_shortcut
 from .sidecar_row import SidecarRow
 
 log = logging.getLogger(__name__)
@@ -102,22 +104,6 @@ _LEVEL_SORT: dict[FieldLevel, int] = {
 }
 
 
-def _python_value_kind(val: Any) -> str:
-    if val is None:
-        return "null"
-    if isinstance(val, bool):
-        return "bool"
-    if isinstance(val, (int, float)):
-        return "number"
-    if isinstance(val, str):
-        return "string"
-    if isinstance(val, list):
-        return "array"
-    if isinstance(val, dict):
-        return "object"
-    return "string"
-
-
 def _schema_specs(verdict, current_file) -> dict:
     """What the standard declares about each field of this kind of file.
 
@@ -130,12 +116,24 @@ def _schema_specs(verdict, current_file) -> dict:
     from ...metadata.template_plan import as_template_field
     from ...schema import dataset_description_fields, sidecar_fields
 
+    from ... import schema
+
     try:
         if current_file is not None and \
                 current_file.name == "dataset_description.json":
             specs = dataset_description_fields()
         elif verdict is not None and verdict.datatype and verdict.suffix:
             specs = sidecar_fields(verdict.datatype, verdict.suffix)
+        elif current_file is not None and \
+                current_file.parent.name in schema.list_datatypes():
+            # No report yet: the file's own folder and name say what it is,
+            # so Tree view explains a field (and finds it by what it means)
+            # before any validation, as the BIDS view does.
+            stem = current_file.name.split(".", 1)[0]
+            specs = sidecar_fields(
+                current_file.parent.name, stem.rsplit("_", 1)[-1],
+                entities=schema.name_entities(current_file.name),
+            )
         else:
             return {}
     except Exception as exc:  # noqa: BLE001 - a form must still render
@@ -256,10 +254,7 @@ def _load_json_fields_from_disk(path: Path) -> list[SidecarField]:
         return []
     fields: list[SidecarField] = []
     for key, val in data.items():
-        if isinstance(val, str) and val.strip().upper() == "TODO":
-            kind = "todo"
-        else:
-            kind = _python_value_kind(val)
+        kind = value_kind(val)
         fields.append(
             SidecarField(
                 level=FieldLevel.OPTIONAL,
@@ -272,26 +267,28 @@ def _load_json_fields_from_disk(path: Path) -> list[SidecarField]:
     return fields
 
 
+def _schema_rows(path: Path, root: Optional[Path]) -> list[SidecarField]:
+    """The form rows the schema gives this JSON, levels and all, without a
+    validation report. Empty when the file is not a kind the schema knows."""
+    from ... import schema
+    from ...editor.bidsmgr_checks import sidecar_fields_for
+
+    stem = path.name.split(".", 1)[0]
+    suffix = stem.rsplit("_", 1)[-1] if "_" in stem else ""
+    datatype = path.parent.name if path.parent.name in schema.list_datatypes() else None
+    try:
+        return sidecar_fields_for(path, datatype, suffix, root)
+    except Exception as exc:  # noqa: BLE001 - a form must still render
+        log.debug("no schema rows for %s: %s", path, exc)
+        return []
+
+
 def _find_verdict(report, root: Path, path: Path) -> Optional[FileVerdict]:
-    """Return the FileVerdict matching ``path`` (absolute)."""
-    try:
-        target_abs = str(path.resolve())
-    except OSError:
-        target_abs = str(path)
-    try:
-        root_resolved = root.resolve()
-    except OSError:
-        root_resolved = root
-    for fv in report.files:
-        fp = fv.path
-        candidate = fp if fp.is_absolute() else root_resolved / fp
-        try:
-            candidate_abs = str(candidate.resolve())
-        except OSError:
-            candidate_abs = str(candidate)
-        if candidate_abs == target_abs:
-            return fv
-    return None
+    """Return the FileVerdict matching ``path``: one lookup
+    (``editor.report_index``), not a walk of the report."""
+    from ...editor.report_index import find_verdict
+
+    return find_verdict(report, root, path)
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +328,14 @@ class SidecarFormPane(QWidget):
     apply_to_others_requested = pyqtSignal(str)
     # A row asked where its value is actually stated.
     explain_requested = pyqtSignal(str)
+
+    #: A folder open for viewing: every field is read only, nothing is saved.
+    _read_only = False
+
+    def set_read_only(self, on: bool) -> None:
+        """No editing (a folder open for viewing): fields are shown read only
+        and the edit toolbar is hidden. Takes effect on the next file."""
+        self._read_only = bool(on)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -480,6 +485,28 @@ class SidecarFormPane(QWidget):
         self._save_btn.clicked.connect(self.save)
         et.addWidget(self._save_btn)
 
+        # The search, on a row of its own so it can take the pane's width
+        # however narrow the pane is, as in the DICOM header. It narrows
+        # what either view shows and never what is in the file.
+        search_row = QWidget()
+        sr = QHBoxLayout(search_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.setSpacing(8)
+        self.search = SearchField("Find a field, value or description")
+        self.search.setToolTip(
+            "Shows the fields whose name, value or description contains "
+            "this. In Tree view the keys and values inside a field are "
+            "searched too, shown with the field that holds them."
+        )
+        self.search.textChanged.connect(self._apply_search)
+        sr.addWidget(self.search, 1)
+        self._match_count = QLabel("")
+        self._match_count.setObjectName("legend-text")
+        self._match_count.setVisible(False)
+        sr.addWidget(self._match_count)
+        etv.addWidget(search_row)
+        find_shortcut(self, self.search)
+
         # Second row: the field verbs. Tree view only, because the BIDS
         # form's notion of "add a field" is the missing-field row the schema
         # already puts in front of you.
@@ -543,6 +570,12 @@ class SidecarFormPane(QWidget):
         self._empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_hint.setWordWrap(True)
         self._body_layout.insertWidget(0, self._empty_hint)
+        self._no_match = QLabel("")
+        self._no_match.setObjectName("pane-hint")
+        self._no_match.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._no_match.setWordWrap(True)
+        self._no_match.setVisible(False)
+        self._body_layout.insertWidget(1, self._no_match)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -704,6 +737,7 @@ class SidecarFormPane(QWidget):
             style.unpolish(w)
             style.polish(w)
             w.update()
+        self.search.refresh_icon()
 
     # ----------------------------------------------------------------------
     # Internals
@@ -721,15 +755,19 @@ class SidecarFormPane(QWidget):
         1. If a :class:`FileVerdict` is bound and carries
            ``sidecar_fields``, use them — they include schema-required
            "missing" entries the validator pre-computed.
-        2. Otherwise, if the file is JSON, parse it and emit one
-           OPTIONAL field per present key.
-        3. For non-JSON files we return an empty list — the empty-hint
+        2. Otherwise, if the file is JSON, ask the schema directly. Its levels
+           need no validation run, and without them every key used to be
+           shown as OPTIONAL, so a TODO the metadata step wrote into a
+           recommended field read as a TODO in an optional one.
+        3. A JSON the schema has no rule for: one OPTIONAL row per key.
+        4. For non-JSON files we return an empty list — the empty-hint
            explains why.
         """
         if verdict is not None and verdict.sidecar_fields:
             return list(verdict.sidecar_fields)
         if path.name.lower().endswith(".json"):
-            return _load_json_fields_from_disk(path)
+            return (_schema_rows(path, self._current_root)
+                    or _load_json_fields_from_disk(path))
         return []
 
     def _build_legend_once(self) -> None:
@@ -767,6 +805,7 @@ class SidecarFormPane(QWidget):
         # until ``deleteLater`` processes on the next event-loop tick.
         for row in self._rows:
             self._body_layout.removeWidget(row)
+            row.hide()
             row.setParent(None)
             row.deleteLater()
         self._rows.clear()
@@ -808,11 +847,13 @@ class SidecarFormPane(QWidget):
             fields, key=lambda f: _LEVEL_SORT.get(f.level, 99)
         )
         # Editable when the bound file is a JSON sidecar and we have a
-        # readable on-disk cache to save back into.
+        # readable on-disk cache to save back into, and the folder is not open
+        # for viewing only.
         editable = (
             self._current_file is not None
             and self._current_file.name.lower().endswith(".json")
             and self._json_cache is not None
+            and not self._read_only
         )
         insert_idx = self._body_layout.count() - 1  # before the stretch
         # What the standard says about each field, so the editor for it can be
@@ -842,6 +883,7 @@ class SidecarFormPane(QWidget):
             self._body_layout.insertWidget(insert_idx, row)
             insert_idx += 1
             self._rows.append(row)
+        self._apply_search()
 
     def _on_field_committed(
         self,
@@ -872,7 +914,7 @@ class SidecarFormPane(QWidget):
         self._after_edit()
 
     # ----------------------------------------------------------------------
-    # Undo / redo (snapshot-based, in-memory; disk write still via Save)
+    # Undo / redo: unsaved edits in memory, saved ones in the dataset history
     # ----------------------------------------------------------------------
 
     def _on_autosave(self) -> None:
@@ -938,54 +980,77 @@ class SidecarFormPane(QWidget):
         self._refresh_dirty_ui()
         self.history_changed.emit()
 
-    def can_undo(self) -> bool:
+    def _saved_step(self, which: str) -> bool:
+        """True when the dataset's newest saved step to undo (or redo) is a
+        change to THIS file alone, which the pane may then take as its own.
+
+        Unsaved edits live in the pane; a save makes them one step of the
+        dataset's history (``project.operations``), where they survive moving
+        to another file and restarting the app. Several edits saved together
+        are one step, so they go back together."""
+        if (self._current_file is None or self._current_root is None
+                or self.is_dirty()):
+            return False
+        from ...project import operations as ops
+
+        peek = ops.peek_undo if which == "undo" else ops.peek_redo
+        try:
+            return ops.only_touches(peek(self._current_root), self._current_root,
+                                    self._current_file)
+        except OSError:
+            return False
+
+    def has_unsaved_history(self) -> bool:
+        """Edits not saved yet that Undo would take back, one at a time."""
         return self._json_cache is not None and self._history.can_undo
 
-    def can_redo(self) -> bool:
+    def has_unsaved_redo(self) -> bool:
+        """Unsaved edits just undone that Redo would bring back."""
         return self._json_cache is not None and self._history.can_redo
 
+    def can_undo(self) -> bool:
+        return self._json_cache is not None and (
+            self._history.can_undo or self._saved_step("undo"))
+
+    def can_redo(self) -> bool:
+        return self._json_cache is not None and (
+            self._history.can_redo or self._saved_step("redo"))
+
     def undo(self) -> None:
+        """Take back the last unsaved edit or, with none, the last saved change
+        to this file (the file goes back on disk)."""
         if self._json_cache is None:
             return
-        was_saved = not self.is_dirty()
-        snap = self._history.undo(self._snapshot())
-        if snap is not None:
-            self._restore(snap)
-            self._persist_if_it_was_saved(was_saved)
+        if self._history.can_undo:
+            snap = self._history.undo(self._snapshot())
+            if snap is not None:
+                self._restore(snap)
+            return
+        if self._saved_step("undo"):
+            from ...project.operations import undo_last
+
+            undo_last(self._current_root)
+            self.reload_from_disk()
 
     def redo(self) -> None:
         if self._json_cache is None:
             return
-        was_saved = not self.is_dirty()
-        snap = self._history.redo(self._snapshot())
-        if snap is not None:
-            self._restore(snap)
-            self._persist_if_it_was_saved(was_saved)
-
-    def _persist_if_it_was_saved(self, was_saved: bool) -> None:
-        """Write the file back when the step being undone had been saved.
-
-        Without this, undoing after a save changed only the in-memory cache:
-        the file kept the value that had been written, the pane went dirty
-        again, and the user saw a button that did nothing. Half an undo is
-        worse than none, because it leaves the screen and the disk disagreeing.
-
-        The rule is the one a user already holds: what you see is what is on
-        disk, unless you have unsaved changes. So an undo from a CLEAN state
-        writes, and an undo from a dirty one does not, because in that case
-        nothing had reached the disk to revert.
-        """
-        if not was_saved or self._current_file is None:
+        if self._history.can_redo:
+            snap = self._history.redo(self._snapshot())
+            if snap is not None:
+                self._restore(snap)
             return
-        try:
-            self._write_json_cache(self._current_file)
-        except OSError as exc:
-            log.warning("undo could not write %s: %s", self._current_file, exc)
-            self.save_failed.emit(self._current_file, str(exc))
+        if self._saved_step("redo"):
+            from ...project.operations import redo_last
+
+            redo_last(self._current_root)
+            self.reload_from_disk()
+
+    def reload_from_disk(self) -> None:
+        """Show the file as it is on disk now (after an undo or redo changed it)."""
+        if self._current_file is None:
             return
-        self._original_json = copy.deepcopy(self._json_cache)
-        self._refresh_dirty_ui()
-        self.file_saved.emit(self._current_file)
+        self.set_file(self._current_file, self._current_root, self._current_report)
 
     # ----------------------------------------------------------------------
     # View-mode toggle + tree handlers
@@ -1178,8 +1243,43 @@ class SidecarFormPane(QWidget):
                     for name, spec in specs.items() if spec.unit
                 },
             )
+            self._apply_search()
         else:
             self._rebuild_form_with_fields(fields, verdict)
+
+    def _apply_search(self, *_args) -> None:
+        """Show only the fields matching the search, in whichever view is up.
+
+        The query stays when another file is opened, so one field can be
+        followed from file to file. Values are read from the working copy,
+        so a value typed a moment ago is found.
+        """
+        typed = self.search.text().strip()
+        query = typed.lower()
+        if self._view_mode == "tree":
+            total = self._tree_view.topLevelItemCount()
+            shown = self._tree_view.set_filter(query)
+        else:
+            total = len(self._rows)
+            shown = 0
+            for row in self._rows:
+                hit = not query or query in self._row_text(row)
+                row.setVisible(hit)
+                shown += hit
+        self._match_count.setText(f"{shown} of {total}")
+        self._match_count.setVisible(bool(query) and total > 0)
+        self._no_match.setText(f"No field matches “{typed}”.")
+        self._no_match.setVisible(
+            self._view_mode != "tree" and bool(query) and total > 0 and not shown
+        )
+
+    def _row_text(self, row: SidecarRow) -> str:
+        """What a form row is searched by: its name, its value and what the
+        standard says it is, in lower case."""
+        value = (self._json_cache or {}).get(row._key, "")
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        return f"{row._key}\n{value}\n{row.toolTip()}".lower()
 
     def _apply_field_scope(
         self, fields: list[SidecarField],
@@ -1242,7 +1342,7 @@ class SidecarFormPane(QWidget):
                     name=f.name,
                     value=val,
                     present=True,
-                    value_kind=_python_value_kind(val),
+                    value_kind=value_kind(val),
                     description=f.description,
                 )
             patched.append(f)
@@ -1254,7 +1354,7 @@ class SidecarFormPane(QWidget):
                         name=key,
                         value=val,
                         present=True,
-                        value_kind=_python_value_kind(val),
+                        value_kind=value_kind(val),
                     )
                 )
         return patched
@@ -1359,7 +1459,13 @@ class SidecarFormPane(QWidget):
         # Snapshot the new on-disk state so the next dirty check
         # compares against what we just wrote.
         self._original_json = copy.deepcopy(self._json_cache)
+        # What was saved is now one step of the dataset's history, undone
+        # there (``can_undo`` / ``undo`` reach it); the pane keeps only what
+        # is not saved yet.
+        self._history.clear()
+        self._pre_edit = self._snapshot()
         self._refresh_dirty_ui()
+        self.history_changed.emit()
         self.file_saved.emit(self._current_file)
         return True
 
@@ -1401,7 +1507,7 @@ class SidecarFormPane(QWidget):
                         name=f.name,
                         value=val,
                         present=True,
-                        value_kind=_python_value_kind(val),
+                        value_kind=value_kind(val),
                         description=f.description,
                     )
                 patched.append(f)
@@ -1437,6 +1543,7 @@ class SidecarFormPane(QWidget):
             self._current_file is not None
             and self._current_file.name.lower().endswith(".json")
             and self._json_cache is not None
+            and not self._read_only
         )
         self._edit_toolbar.setVisible(editable)
         n = self._dirty_count() if editable else 0

@@ -44,13 +44,15 @@ from uuid import uuid4
 
 import pandas as pd
 
+from ..util.oplog import add_log_arguments, dataset_root_for, log_keywords, logged
 from .. import schema
 from ..classifier import dcm2niix_bidsguess, sequence_dict
 from ..classifier.types import Classification
 from ..classifier.user_rules import (
     ExclusionRule,
     UserHint,
-    exclusion_matches,
+    plan_exclusions,
+    with_exclusion_note,
 )
 from ..classifier import user_rules as user_rules_module
 from ..inventory import probe_convert as probe_convert_module
@@ -63,10 +65,12 @@ from ..inventory.mri_dicom import (
     TSV_COLUMNS,
     scan_dicoms_long,
 )
+from ..inventory.curation import CURATION_COLUMNS
 from ..inventory.pet import PET_COLUMNS, derive_suggestions as derive_pet_suggestions
+from ..inventory.eyetrack import scan_eyetrack
 from ..inventory.pet_ecat import scan_ecat
 from ..inventory.probe_convert import ProbeFileStats
-from ..inventory.types import InventoryRow
+from ..inventory.types import NONIMAGE_ISSUE, InventoryRow
 from ..recording_meta import (
     RecordingMetaSpec,
     dump_spec,
@@ -366,6 +370,7 @@ def _run_classifier_chain(
     rows: list[InventoryRow],
     *,
     user_hints: Optional[list[UserHint]] = None,
+    bidsguess: Optional[dict[str, str]] = None,
 ) -> dict[str, Classification]:
     """Run the BidsGuess classifier first; fall back to sequence_dict.
 
@@ -412,6 +417,12 @@ def _run_classifier_chain(
         if not _is_classification_schema_valid(c):
             log.debug("BidsGuess result rejected by schema: %s", c)
             continue
+        if bidsguess is not None:
+            # dcm2niix's own answer, kept apart: the second opinion the
+            # parameters' decision compares itself with.
+            bidsguess[c.row_id.hex] = (
+                f"exclude/{c.suffix or 'discard'}" if c.skip or c.datatype == "discard"
+                else f"{c.datatype}/{c.suffix}")
         if c.skip or c.datatype == "discard":
             deferred_skips[c.row_id.hex] = c
             continue
@@ -450,6 +461,63 @@ def _run_classifier_chain(
         chosen.setdefault(key, c)
 
     return chosen
+
+
+def _classifier_mode(config) -> str:
+    from ..classifier.acquisition.config import DEFAULT
+
+    return (config or DEFAULT).general.mode
+
+
+def _classify_by_parameters(df, rows, chosen, bidsguess, config) -> dict:
+    """``{row_id hex: Outcome}`` from the acquisition parameters (empty when
+    the classifier is off or nothing has features)."""
+    from ..classifier.acquisition import scan as by_parameters
+    from ..classifier.acquisition.config import DEFAULT
+    from ..classifier.acquisition.features import SeriesFeatures
+
+    config = config or DEFAULT
+    if config.general.mode == "off":
+        return {}
+    raw = df.attrs.get("features_by_uid") or {}
+    features = {uid: SeriesFeatures.from_dict(f) for uid, f in raw.items() if f}
+    if not features:
+        return {}
+    series = [{"key": r.row_id.hex, "uid": r.series_uid or "",
+               "session": f"{r.subject_hint}|{r.session_hint}", "acq_time": r.acq_time}
+              for r in rows]
+    try:
+        return by_parameters.classify(series, features, others=bidsguess, cfg=config)
+    except Exception as exc:  # noqa: BLE001 - the scan must not fail over a second opinion
+        log.warning("classification by acquisition parameters failed: %s", exc)
+        return {}
+
+
+def _write_classification_columns(df, rows, outcomes, *, applied: bool) -> None:
+    """The classifier's confidence, alternatives and evidence on each row
+    (a fieldmap row folded from two series reports its first), and, when its
+    decision applies, a note on the rows to check."""
+    from ..classifier.acquisition import scan as by_parameters
+    from ..inventory.curation import CURATION_COLUMNS
+
+    for col in CURATION_COLUMNS:
+        if col not in df.columns:
+            _init_object_column(df, col)
+    seen: set = set()
+    for r in rows:
+        idx = r.raw_metadata.get("df_index")
+        outcome = outcomes.get(r.row_id.hex)
+        if idx is None or outcome is None or idx in seen:
+            continue
+        seen.add(idx)
+        for col, value in by_parameters.columns(outcome).items():
+            df.at[idx, col] = value
+        d = outcome.decision
+        if applied and d.check and d.name and not d.excluded:
+            issues = str(df.at[idx, "issues"] or "") if "issues" in df.columns else ""
+            note = f"{by_parameters.CHECK_TOKEN}: " + (d.note or "the evidence is weak")
+            if by_parameters.CHECK_TOKEN not in issues:
+                df.at[idx, "issues"] = f"{issues}; {note}" if issues else note
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +590,11 @@ def _detect_aborts(
         row = rows_by_id.get(row_key)
         if row is None:
             continue
-        sig = _entity_signature(c.candidate_entities)
+        # ``part`` names the magnitude and phase of one acquisition; the
+        # image type already tells those apart here, and grouping on it
+        # would hide an aborted attempt that has no phase twin.
+        sig = _entity_signature({k: v for k, v in c.candidate_entities.items()
+                                 if k != "part"})
         gk = (
             row.subject_hint or "",
             row.session_hint or "",
@@ -850,7 +922,8 @@ def _is_real_answer(value) -> bool:
     return True
 
 
-def _finish_unified_frame(merged, exclusions, index_widths=None) -> None:
+def _finish_unified_frame(merged, exclusions, index_widths=None,
+                          drop_entities=None) -> None:
     """The last passes over the finished inventory, whatever it holds.
 
     Extracted because there are two write paths, one for a tree with MRI in it
@@ -860,11 +933,22 @@ def _finish_unified_frame(merged, exclusions, index_widths=None) -> None:
     one name per subject, and nothing said so.
 
     Order matters. Exclusions first, because an excluded row is never written
-    and so cannot collide. Names next. The mixed-study heads-up last, so it only
-    ever appends to ``issues`` and never downgrades a more severe row
-    state.
+    and so cannot collide. Names next: the entities the user leaves out, then
+    index widths, then runs for what still collides. The mixed-study heads-up
+    last, so it only ever appends to ``issues`` and never downgrades a more
+    severe row state.
     """
     _apply_user_exclusions(merged, exclusions)
+
+    # Entities the user does not want in names, left out where the standard
+    # does not require them and they do not tell two recordings apart.
+    if drop_entities:
+        from ..inventory.leave_out import apply_leave_out, plan_leave_out
+
+        plan = plan_leave_out(merged, drop_entities)
+        apply_leave_out(merged, plan)
+        if plan.summary():
+            print(plan.summary())
 
     # Index widths, before collisions are counted: two rows that differ only
     # by padding are the same name once padded, and the collision pass is
@@ -1143,13 +1227,6 @@ def _entity_long_names() -> dict[str, str]:
 _ENTITY_LONG = _entity_long_names()
 
 
-NONIMAGE_ISSUE_TOKEN = "non-image series"
-NONIMAGE_ISSUE = (
-    "non-image series: the DICOM headers carry no pixel data "
-    "(Rows/Columns absent), so dcm2niix cannot convert it to NIfTI. "
-    "This is typically a scanner-derived object such as a Siemens "
-    "diffusion TENSOR map. Excluded from conversion."
-)
 
 
 def _is_nonimage_flag(val: object) -> bool:
@@ -1343,14 +1420,16 @@ def _classify_pet_rows(df: pd.DataFrame) -> None:
     for idx in df.index:
         if str(df.at[idx, "_dicom_modality"] or "").strip().upper() != "PT":
             continue
+        # The modality is the tag's, whoever names the series: a PET series
+        # dcm2niix had already classified kept "mri" (20 of 23 phantoms).
+        if "modality" in df.columns:
+            df.at[idx, "modality"] = "pet"
         if str(df.at[idx, "bids_guess_datatype"] or "").strip():
             continue  # the probe already classified it
         df.at[idx, "bids_guess_datatype"] = "pet"
         df.at[idx, "bids_guess_suffix"] = "pet"
         df.at[idx, "bids_guess_classifier"] = "dicom_modality"
         df.at[idx, "bids_guess_confidence"] = 0.80
-        if "modality" in df.columns:
-            df.at[idx, "modality"] = "pet"
 
 
 def _mrs_may_overrule(classifier: str) -> bool:
@@ -1530,9 +1609,6 @@ def _fill_pet_suggestions(df: pd.DataFrame) -> None:
 # Marker prepended to ``issues`` for a user-excluded series. Mirrors
 # the non-image precedent: row stays visible (include=0) so the user can
 # re-enable it; the GUI surfaces the reason via the issues column / tooltip.
-USER_EXCLUDED_ISSUE_TOKEN = "user-excluded"
-
-
 def _apply_user_exclusions(
     df: pd.DataFrame,
     exclusions: Optional[list[ExclusionRule]],
@@ -1540,37 +1616,18 @@ def _apply_user_exclusions(
     """Flag rows matching a user exclusion rule: ``include=0`` +
     ``bids_guess_skip`` + a ``user-excluded`` note prepended to
     ``issues``. Reversible (the row stays in the inventory; the user
-    can re-tick ``include``). Matches the rule against the series description
-    (``sequence``) or the relative path (``source_folder`` / ``source_file``).
+    can re-tick ``include``). Which rows: ``user_rules.plan_exclusions``,
+    the one definition the GUI also applies to an open table.
     """
     if not exclusions:
         return
-
-    def _cell(idx, col: str) -> str:
-        return str(df.at[idx, col]).strip() if col in df.columns else ""
-
-    for idx in df.index:
-        sequence = _cell(idx, "sequence")
-        path = _cell(idx, "source_folder") or _cell(idx, "source_file")
-        matched = next(
-            (r for r in exclusions
-             if exclusion_matches(r, sequence=sequence, path=path)),
-            None,
-        )
-        if matched is None:
-            continue
+    for idx, rule in plan_exclusions(df, exclusions).exclude:
         if "include" in df.columns:
             df.at[idx, "include"] = 0
         if "bids_guess_skip" in df.columns:
             df.at[idx, "bids_guess_skip"] = True
-        note = (
-            f"{USER_EXCLUDED_ISSUE_TOKEN}: matched the scan exclusion rule "
-            f"'{matched.pattern}' ({matched.target}/{matched.match_mode}); "
-            "excluded from conversion. Re-tick 'include' to convert it anyway."
-        )
-        existing = str(df.at[idx, "issues"] or "").strip() if "issues" in df.columns else ""
         if "issues" in df.columns:
-            df.at[idx, "issues"] = f"{note} | {existing}" if existing else note
+            df.at[idx, "issues"] = with_exclusion_note(str(df.at[idx, "issues"] or ""), rule)
 
 
 def _probe_anomaly(
@@ -1755,7 +1812,7 @@ def _unified_column_order(df: pd.DataFrame) -> list[str]:
     """Final unified TSV column order. Locked contract:
 
     ``TSV(24) + BIDS_GUESS(8) + ENTITIES(1) + DATASET(1) + PROBE(4) +
-    EXTENDED(3) + EEG_MEG(16) + PET(5) = 62``.
+    EXTENDED(3) + EEG_MEG(16) + PET(5) + CURATION(4) = 66``.
 
     The ``entities`` column carries the canonical JSON-encoded BIDS
     entity dict; the converter and ``bidsmgr-rebuild`` use it as the
@@ -1774,6 +1831,7 @@ def _unified_column_order(df: pd.DataFrame) -> list[str]:
         + [c for c in EXTENDED_COLUMNS if c in df.columns]
         + [c for c in EEG_MEG_COLUMNS if c in df.columns]
         + [c for c in PET_COLUMNS if c in df.columns]
+        + [c for c in CURATION_COLUMNS if c in df.columns]
     )
 
 
@@ -1788,7 +1846,7 @@ def _finalize_unified_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     all_cols = (
         list(TSV_COLUMNS) + list(BIDS_GUESS_COLUMNS) + list(BIDS_ENTITIES_COLUMNS)
         + list(DATASET_COLUMNS) + list(PROBE_COLUMNS) + list(EXTENDED_COLUMNS)
-        + list(EEG_MEG_COLUMNS) + list(PET_COLUMNS)
+        + list(EEG_MEG_COLUMNS) + list(PET_COLUMNS) + list(CURATION_COLUMNS)
     )
     for col in all_cols:
         if col not in df.columns:
@@ -1932,6 +1990,15 @@ def _apply_index_widths(df: "pd.DataFrame", widths: dict[str, int]) -> int:
     return changed
 
 
+@logged("scan", lambda a: (
+    dataset_root_for(Path(a["output_tsv"]).parent),
+    {"raw data": a["dicom_root"], "inventory": a["output_tsv"], "workers": a["n_jobs"],
+     "probe conversion": a["probe_convert"],
+     "scan rules": f"{len(a['user_hints'] or [])} hint(s), "
+                   f"{len(a['exclusions'] or [])} exclusion(s)",
+     "entities left out": ", ".join(a["drop_entities"] or ()) or "none",
+     "acquisition parameters": (a["classifier_config"].general.mode
+                                if a["classifier_config"] is not None else "applied")}))
 def run_scan(
     dicom_root: Path,
     output_tsv: Path,
@@ -1947,6 +2014,8 @@ def run_scan(
     user_hints: Optional[list[UserHint]] = None,
     exclusions: Optional[list[ExclusionRule]] = None,
     index_widths: Optional[dict[str, int]] = None,
+    classifier_config=None,
+    drop_entities: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     """Run the full scan pipeline and return the DataFrame written to TSV.
 
@@ -1981,6 +2050,10 @@ def run_scan(
         ``.tmp/`` scratch tree is **always wiped** when ``run_scan``
         returns — including on error — so the user is left with the
         inventory TSV and nothing else. MRI rows only.
+    drop_entities
+        Short entity keys (``acq``, ``run``) to leave out of the proposed
+        names, wherever the standard does not require them and they do not
+        tell two recordings apart (``inventory.leave_out``).
     """
 
     dataset_slug = dataset if dataset else _default_dataset_slug(dicom_root)
@@ -2019,6 +2092,17 @@ def run_scan(
             else pd.concat([df_eeg, df_ecat], ignore_index=True, sort=False)
         )
 
+    # Eye-tracking branch: EyeLink .edf / .asc, by signature (a European Data
+    # Format .edf is EEG and stays with the walk above, which skips these).
+    df_eye = scan_eyetrack(Path(dicom_root), dataset=dataset_slug or "",
+                           cancel_check=cancel_check)
+    if not df_eye.empty:
+        _renumber_subjects_after(df_eye, (df, df_eeg))
+        df_eeg = (
+            df_eye if df_eeg.empty
+            else pd.concat([df_eeg, df_eye], ignore_index=True, sort=False)
+        )
+
     if df.empty and df_eeg.empty:
         log.warning("no DICOMs or EEG/MEG recordings found under %s", dicom_root)
         empty = _empty_unified_dataframe()
@@ -2031,7 +2115,7 @@ def run_scan(
             if col not in df_eeg.columns:
                 _init_object_column(df_eeg, col)
         merged = _finalize_unified_dataframe(df_eeg)
-        _finish_unified_frame(merged, exclusions, index_widths)
+        _finish_unified_frame(merged, exclusions, index_widths, drop_entities)
         merged.to_csv(output_tsv, sep="\t", index=False, columns=_unified_column_order(merged))
         print(f"Inventory written to: {output_tsv}")
         scaffold_path = _write_recording_meta_scaffold(merged, Path(output_tsv))
@@ -2048,6 +2132,7 @@ def run_scan(
     rows = _rows_from_dataframe(df)
 
     chosen: dict[str, Classification] = {}
+    bidsguess: dict[str, str] = {}
     if skip_bids_guess:
         # Only run sequence_dict (legacy regex layer). User hints (force +
         # non-force) still apply, taking priority over the regex fallback.
@@ -2055,7 +2140,20 @@ def run_scan(
         for c in sequence_dict.classify(rows):
             chosen.setdefault(c.row_id.hex, c)
     else:
-        chosen = _run_classifier_chain(rows, user_hints=user_hints)
+        chosen = _run_classifier_chain(rows, user_hints=user_hints, bidsguess=bidsguess)
+
+    # The parameters' opinion (classifier/acquisition): scored on the features
+    # the header pass read, decided against dcm2niix's own guess, and, in
+    # applied mode, laid over the chain's choice. A forced scan rule stands.
+    outcomes = _classify_by_parameters(df, rows, chosen, bidsguess, classifier_config)
+    if outcomes and _classifier_mode(classifier_config) == "applied":
+        from ..classifier.acquisition import scan as by_parameters
+
+        forced = {k for k, c in chosen.items()
+                  if c.classifier.startswith("user_hint") and
+                  c.confidence >= _FORCE_HINT_CONFIDENCE}
+        chosen = by_parameters.apply(chosen, outcomes, {r.row_id.hex: r.row_id for r in rows},
+                                     forced=forced)
 
     chosen = _reroute_b0_references_to_fmap_epi(rows, chosen)
     abort_verdicts = _detect_aborts(rows, chosen)
@@ -2099,6 +2197,8 @@ def run_scan(
                         )
 
     df = _augment_dataframe(df, rows, chosen, abort_verdicts, probe_stats)
+    _write_classification_columns(df, rows, outcomes,
+                                  applied=_classifier_mode(classifier_config) == "applied")
     df.drop(columns=["_source_dir"], errors="ignore", inplace=True)
 
     # Concatenate MRI + EEG/MEG rows into the unified shape. Columns that
@@ -2112,7 +2212,7 @@ def run_scan(
     # Exclusions, name collisions and the mixed-study heads-up, on the unified
     # frame so they cover MRI and EEG/MEG alike. Shared with the EEG-only path
     # above, which is what stopped them drifting apart again.
-    _finish_unified_frame(merged, exclusions, index_widths)
+    _finish_unified_frame(merged, exclusions, index_widths, drop_entities)
 
     merged.to_csv(
         output_tsv, sep="\t", index=False,
@@ -2137,6 +2237,10 @@ def run_scan(
     # EEG/MEG rows store ``source_file`` directly in the TSV so they don't
     # need this map.
     files_by_uid = df.attrs.get("files_by_uid", {})
+    # How each series was acquired, for scoring the table again without a scan.
+    from ..classifier.acquisition import cache as features_cache
+
+    features_cache.write(output_tsv, df.attrs.get("features_by_uid", {}))
     if files_by_uid:
         sidecar_path = _write_files_by_uid_sidecar(output_tsv, files_by_uid)
         print(f"files_by_uid sidecar written to: {sidecar_path}")
@@ -2238,6 +2342,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--drop-entity", action="append", default=[], metavar="ENTITY",
+        help=(
+            "Leave ENTITY (a short key such as acq or run) out of the proposed "
+            "names. Kept where the standard requires it, and where it is what "
+            "tells two recordings apart, so no name is lost. Repeat it, or "
+            "give several separated by commas: --drop-entity acq,rec."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -2262,7 +2375,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
 
+    parser.add_argument(
+        "--classifier", choices=("applied", "shadow", "off"), default=None,
+        help="Name MRI series from their acquisition parameters (applied, the default), "
+             "only report what that would do (shadow), or not at all (off). Overrides "
+             "the mode in --classifier-config.")
+    parser.add_argument(
+        "--classifier-config", type=Path, default=None, metavar="JSON",
+        help="The parameter classifier's settings: thresholds, the weight of each kind "
+             "of evidence, the physics ranges (--print-classifier-config writes one).")
+    parser.add_argument(
+        "--print-classifier-config", action="store_true",
+        help="Print the parameter classifier's default settings as JSON and stop.")
+
+    add_log_arguments(parser)
     args = parser.parse_args(argv)
+    if args.print_classifier_config:
+        from ..classifier.acquisition.config import ClassifierConfig
+
+        print(ClassifierConfig().model_dump_json(indent=2))
+        return 0
+    from .classify import load_config
+
+    try:
+        classifier_config = load_config(args.classifier_config)
+    except (OSError, ValueError) as exc:
+        parser.error(f"--classifier-config could not be read: {exc}")
+    if args.classifier:
+        classifier_config.general.mode = args.classifier
     # One version for the whole run, adopted before any schema question is
     # asked. Without this the flag would reach the validator alone and a
     # dataset could be filled in against one version and checked against
@@ -2272,6 +2412,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     level = logging.WARNING - 10 * min(args.verbose, 2)
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+
+    from ..inventory.leave_out import offered
+
+    drop_entities = [k.strip() for v in args.drop_entity for k in v.split(",") if k.strip()]
+    unknown = [k for k in drop_entities if k not in offered()]
+    if unknown:
+        parser.error(
+            f"--drop-entity cannot leave out {', '.join(unknown)}. Choose from: "
+            + ", ".join(offered()) + " (sub, ses and task name the recording).")
 
     user_hints: Optional[list[UserHint]] = None
     exclusions: Optional[list[ExclusionRule]] = None
@@ -2319,6 +2468,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             dataset=args.dataset or bids_root.name,
             line_freq=args.line_freq, montage=args.montage,
             user_hints=user_hints, exclusions=exclusions,
+            classifier_config=classifier_config,
+            drop_entities=drop_entities,
+            **log_keywords(args),
         )
         version = import_scan_as_version(
             bids_root, staged_tsv, raw_root=Path(args.dicom_root),
@@ -2343,6 +2495,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         montage=args.montage,
         user_hints=user_hints,
         exclusions=exclusions,
+        classifier_config=classifier_config,
+        drop_entities=drop_entities,
+        **log_keywords(args),
     )
     return 0
 

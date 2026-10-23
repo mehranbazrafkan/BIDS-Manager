@@ -56,6 +56,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import icons
+from ..icons import FOLDER_RECORDING_SUFFIXES, color_token_for
 from ..delegates.bids_tree import (
     BADGE_ROLE,
     COUNT_ROLE,
@@ -90,7 +91,6 @@ _SKIP_DIRS: frozenset[str] = frozenset({
 
 # Directories whose contents are *one* BIDS recording — collapse them
 # to a leaf node and stop recursing.
-_FOLDER_RECORDING_SUFFIXES: tuple[str, ...] = (".ds", ".mff")
 
 # Item data roles.
 PATH_ROLE = Qt.ItemDataRole.UserRole          # absolute path string
@@ -101,38 +101,19 @@ IS_DIR_ROLE = Qt.ItemDataRole.UserRole + 6
 #: Marks the single stand-in child that keeps a folder's expander arrow
 #: alive until the folder is drawn.
 PLACEHOLDER_ROLE = Qt.ItemDataRole.UserRole + 7
+#: The ``.bidsignore`` line (or the standard's folder) that keeps the row out
+#: of validation; None when it is validated.
+IGNORED_ROLE = Qt.ItemDataRole.UserRole + 8
 # COUNT_ROLE and ISSUE_ROLE are defined by the delegate that paints them and
 # re-exported here, because every role the tree uses should be reachable from
 # the tree.
 
 
-def _color_token_for(entry_name: str, is_dir: bool) -> str:
-    """Pick the palette token used to color a row.
-
-    Folder-recordings (``.ds`` / ``.mff``) are colored like data files
-    (``text``) even though they're directories on disk, because the
-    user thinks of them as recordings.
-    """
-    lower = entry_name.lower()
-    if is_dir and not lower.endswith(_FOLDER_RECORDING_SUFFIXES):
-        return "accent"
-    if lower.endswith(".nii.gz") or lower.endswith(".nii"):
-        return "text"
-    if lower.endswith(".json"):
-        return "purple"
-    if lower.endswith(".tsv") or lower.endswith(".tsv.gz"):
-        return "teal"
-    if lower.endswith(_FOLDER_RECORDING_SUFFIXES):
-        # CTF .ds / EGI .mff — folder-shaped recordings.
-        return "text"
-    return "dim"
-
-
 def _is_folder_recording(name: str) -> bool:
-    return name.lower().endswith(_FOLDER_RECORDING_SUFFIXES)
+    return name.lower().endswith(FOLDER_RECORDING_SUFFIXES)
 
 
-def _norm_path(p) -> str:
+def _norm_path(p) -> str:  # noqa: D401 - kept for paths outside the root
     """Resolve a path to a comparable string.
 
     Resolving both sides means macOS ``/private/var/...`` vs ``/var/...``
@@ -202,6 +183,40 @@ def _in_session(path: Path) -> bool:
     return any(part.startswith("ses-") for part in path.parts)
 
 
+def _sidecar_entry(root: Path, scope: list) -> Optional[tuple[str, bool]]:
+    """The right-click entry that writes sidecars from the recordings, and
+    whether it adds to existing ones; ``None`` where there is nothing to
+    write a sidecar for. Any file BIDS Manager can read counts, BIDS name or
+    not: its sidecar is written beside it."""
+    from ...editor.sidecars import is_candidate, recording_for, sidecar_path
+
+    def has_one(path: Path) -> Optional[bool]:
+        """True: a recording with a sidecar (or its sidecar); False: one
+        without; None: neither."""
+        if path.name.endswith(".json"):
+            return True if recording_for(path, root) is not None else None
+        if is_candidate(root, path):
+            return sidecar_path(path).exists()
+        return None
+
+    if len(scope) > 1:
+        states = [has_one(Path(p)) for p in scope]
+        if all(s is True for s in states):
+            return f"Complete the sidecars of these {len(scope)} from the recordings...", True
+        return f"Write the sidecars of these {len(scope)} items from the recordings...", False
+    path = Path(scope[0])
+    state = has_one(path)
+    if state is None:
+        if path.is_dir():
+            return "Write missing sidecars here from the recordings...", False
+        return None
+    if path.name.endswith(".json"):
+        return "Complete this sidecar from its recording...", True
+    if state:
+        return "Complete its sidecar from the recording...", True
+    return "Write its sidecar from the recording...", False
+
+
 def _can_restructure(path: Path) -> bool:
     """Is it meaningful to change the entities of what was clicked?
 
@@ -215,6 +230,44 @@ def _can_restructure(path: Path) -> bool:
     return any(part.startswith("sub-") for part in parts)
 
 
+def _can_delete(path: Path, root: Optional[Path]) -> bool:
+    """May what was clicked be offered for deletion? Anything inside the
+    dataset that is not hidden (the tool's own ``.bidsmgr/`` is)."""
+    if root is None:
+        return False
+    try:
+        parts = Path(path).relative_to(root).parts
+    except ValueError:
+        return False
+    return bool(parts) and not any(is_hidden_name(part) for part in parts)
+
+
+def _stop_tip(choice) -> str:
+    """What a "Stop ignoring" choice writes, for its tooltip."""
+    bits = []
+    if choice.patterns:
+        bits.append("removes " + ", ".join(choice.patterns))
+    if choice.exceptions:
+        bits.append("adds an exception for what a wider line also hides ("
+                    + ", ".join(choice.exceptions[:3])
+                    + (" ..." if len(choice.exceptions) > 3 else "") + ")")
+    return ("In .bidsignore, " + "; ".join(bits) + ". One step in the Editor's history."
+            if bits else "")
+
+
+def _hollow_tree(folder: Path) -> bool:
+    """A folder with no file in it at any depth, the operating system's
+    droppings aside: what the menu calls an empty folder."""
+    import os
+
+    from ...project.operations import is_os_junk
+
+    for _dirpath, _dirs, files in os.walk(folder):
+        if any(not is_os_junk(name) for name in files):
+            return False
+    return True
+
+
 def _sweep(
     folder: Path,
     *,
@@ -222,6 +275,7 @@ def _sweep(
     dirs: list[str],
     counts: dict[str, tuple[int, int, int]],
     show_hidden: bool,
+    watchable: bool = True,
 ) -> tuple[int, int]:
     """One scandir pass: every directory, and what is inside each.
 
@@ -240,6 +294,18 @@ def _sweep(
     A directory with nothing visible inside counts as one file, and a
     folder-recording (a CTF ``.ds``, an EGI ``.mff``) counts as one file
     rather than being descended into. Both match what the tree draws.
+
+    ``watchable`` is how a :data:`_SKIP_DIRS` subtree gets DRAWN but never
+    WATCHED. A watch is an open handle on the directory, and conversion
+    stages each subject in ``.tmp_bidsmgr/sub-<id>/`` inside the dataset:
+    on Windows a directory cannot be moved while a handle is open anywhere
+    inside it, so one watch there failed every commit with ``WinError 5``
+    for as long as the pane lived. Measured, with "Show hidden files" on:
+    4 watches land under ``.tmp_bidsmgr`` and the commit is refused;
+    ``removePaths`` and the same commit succeeds. Showing the folder costs
+    nothing, so only the handle is withheld — and on Linux that also stops
+    a transient staging tree from spending the inotify watches ``_watch``
+    is careful to cap.
     """
     if depth >= _MAX_DEPTH:
         return (0, 1)
@@ -257,10 +323,13 @@ def _sweep(
             continue
         seen += 1
         if entry.is_dir() and not _is_folder_recording(entry.name):
-            dirs.append(entry.path)
+            # Machinery, and everything below it: drawn, never handed a watch.
+            child_watchable = watchable and entry.name not in _SKIP_DIRS
+            if child_watchable:
+                dirs.append(entry.path)
             sub_sessions, sub_files = _sweep(
                 Path(entry.path), depth=depth + 1, dirs=dirs, counts=counts,
-                show_hidden=show_hidden,
+                show_hidden=show_hidden, watchable=child_watchable,
             )
             sessions += sub_sessions
             files += sub_files
@@ -279,36 +348,53 @@ def _rollup(
 ) -> tuple[dict[str, str], dict[str, tuple[int, int]]]:
     """Per-DIRECTORY worst severity and finding totals, from the file maps.
 
-    Each finding is walked up its own ancestry, so a folder's answer does not
+    Each finding counts toward every ancestor, so a folder's answer does not
     depend on whether the folder has been drawn. A folder gets the SUM over
     its descendants and not the worst of them, because the point of a number
     is to say how much work is in there: a subject with one missing
     recommended field should not look like a subject with ninety.
+
+    Folder by folder: the files are first summed into the folder that holds
+    them, and each FOLDER then walks its ancestors once. Walking every file's
+    ancestry (to the file system's root) was 0.77 s of every report on a
+    21,663-file dataset; there are some 1,800 folders.
     """
-    badges: dict[str, str] = {}
-    totals: dict[str, tuple[int, int]] = {}
-
-    def ancestors(key: str):
-        parent = os.path.dirname(key)
-        while parent and parent != os.path.dirname(parent):
-            yield parent
-            parent = os.path.dirname(parent)
-
+    own_rank: dict[str, int] = {}
+    own_total: dict[str, tuple[int, int]] = {}
     for key, severity in leaf_map.items():
         rank = _SEVERITY_RANK.get(severity)
         if rank is None:
             continue
-        for parent in ancestors(key):
-            current = badges.get(parent)
-            if current is None or rank > _SEVERITY_RANK[current]:
-                badges[parent] = severity
-
+        folder = os.path.dirname(key)
+        if rank > own_rank.get(folder, -1):
+            own_rank[folder] = rank
     for key, (errors, warnings) in count_map.items():
-        for parent in ancestors(key):
+        folder = os.path.dirname(key)
+        have = own_total.get(folder, (0, 0))
+        own_total[folder] = (have[0] + errors, have[1] + warnings)
+
+    by_rank = {rank: name for name, rank in _SEVERITY_RANK.items()}
+    best: dict[str, int] = {}
+    totals: dict[str, tuple[int, int]] = {}
+
+    def up(folder: str):
+        while folder:
+            yield folder
+            parent = os.path.dirname(folder)
+            if parent == folder:
+                return
+            folder = parent
+
+    for folder, rank in own_rank.items():
+        for parent in up(folder):
+            if best.get(parent, -1) >= rank:
+                break                   # an ancestor already as bad: so are its own
+            best[parent] = rank
+    for folder, (errors, warnings) in own_total.items():
+        for parent in up(folder):
             have = totals.get(parent, (0, 0))
             totals[parent] = (have[0] + errors, have[1] + warnings)
-
-    return badges, totals
+    return {k: by_rank[r] for k, r in best.items()}, totals
 
 
 def _annotate_folder(
@@ -375,13 +461,32 @@ class BidsTreePane(QWidget):
     deface_revert_requested = pyqtSignal(list)
     #: Keep only the brain in the clicked images. ``list[Path]``.
     strip_requested = pyqtSignal(list)
+    #: Write or complete sidecars from the clicked recordings: ``(paths,
+    #: whether to add to sidecars that are there)``.
+    sidecars_requested = pyqtSignal(list, bool)
     #: Put the clicked images side by side. ``list[Path]``, one or two.
     compare_requested = pyqtSignal(list)
     #: Open the references tool on the clicked file. ``list[Path]``, one file.
     links_requested = pyqtSignal(list)
+    #: Draw the clicked image over another: ``(overlay, base)`` paths.
+    overlay_requested = pyqtSignal(object, object)
+    #: The dataset on disk may have changed: a new root, or a refresh after an
+    #: operation or a change the watcher saw. ``Path``, the root.
+    tree_changed = pyqtSignal(object)
+    #: An ``editor.bidsignore.IgnoreChoice`` to make: ignoring
+    #: (``ignore_requested``) or validating again (``unignore_requested``);
+    #: the list of what is ignored, to open.
+    #: Paths whose subjects and sessions to anonymise.
+    anonymise_requested = pyqtSignal(list)
+    ignore_requested = pyqtSignal(object)
+    unignore_requested = pyqtSignal(object)
+    ignore_list_requested = pyqtSignal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        #: The host's answer to "which image would the clicked one go over",
+        #: ``fn(clicked) -> Optional[Path]``. None: no overlay entry.
+        self.overlay_base = None
         self.setObjectName("pane")
         self._root: Optional[Path] = None
         # Remember the last severity badges so a live (watcher-driven) refresh
@@ -475,7 +580,7 @@ class BidsTreePane(QWidget):
         # to grow WILL grow: these two are a fixed-size control, not text.
         from ..theme_manager import scaled_px
         for button in (self._collapse_btn, self._expand_btn):
-            button.setFixedSize(scaled_px(30), scaled_px(22))
+            button.setFixedSize(scaled_px(24), scaled_px(22))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
 
         header_line.addWidget(group, 0)
@@ -508,8 +613,8 @@ class BidsTreePane(QWidget):
         self._tree.customContextMenuRequested.connect(self._on_show_context_menu)
 
         self._hint = QLabel(
-            "No BIDS dataset opened.\n\n"
-            "Use “Open BIDS root…” in the toolbar."
+            "No folder opened.\n\n"
+            "Use “Open folder…” in the toolbar."
         )
         self._hint.setObjectName("pane-hint")
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -601,6 +706,9 @@ class BidsTreePane(QWidget):
         if hasattr(self, "_expand_btn"):
             self._expand_btn.setEnabled(self._next_folded_depth() is not None)
 
+    #: A folder open for viewing: the right-click offers no tool that writes.
+    read_only = False
+
     def set_root(self, path: Optional[Path]) -> None:
         """Switch the tree to a new BIDS root (or clear it with ``None``).
 
@@ -644,6 +752,7 @@ class BidsTreePane(QWidget):
         # to go down anyway.
         self.collapse_all()
         self._stack.setCurrentIndex(1)
+        self.tree_changed.emit(path)
 
     def refresh(self) -> None:
         """Re-walk the current root, preserving the user's view.
@@ -674,6 +783,7 @@ class BidsTreePane(QWidget):
         # markers are still valid for files that survived the change).
         if self._last_badges:
             self._apply_badge_map(self._last_badges, self._last_counts)
+        self.tree_changed.emit(self._root)
 
     def _populate(self, path: Path) -> list[str]:
         """Sweep ``path``, draw its first level, return the dirs to watch.
@@ -709,9 +819,144 @@ class BidsTreePane(QWidget):
             show_hidden=self._show_hidden,
         )
         self._counts = counts
+        self._load_ignore(path)
         self._fill_level(top)
         self._stack.setCurrentIndex(1)
         return dirs
+
+    # ------------------------------------------------------------------
+    # What validation ignores
+    # ------------------------------------------------------------------
+
+    _ignore = None
+    _listing = None
+
+    def _load_ignore(self, root: Path) -> None:
+        """The validator's own matcher (the standard's folders included),
+        read with the tree; the file listing for the menu is taken when a
+        menu first needs it."""
+        from ...editor import bidsignore as bi
+
+        try:
+            self._ignore = bi.matcher(root)
+        except OSError:
+            self._ignore = None
+        self._listing = None
+
+    def ignored_reason(self, path) -> Optional[str]:
+        """Why ``path`` is not validated (its ``.bidsignore`` line, or the
+        standard's folder), or None."""
+        if self._ignore is None or self._root is None:
+            return None
+        try:
+            rel = Path(path).relative_to(self._root).as_posix()
+        except ValueError:
+            return None
+        if rel in ("", "."):
+            return None
+        return self._ignore.deciding(rel)
+
+    def _mark_ignored(self, item: QTreeWidgetItem, pal: dict) -> None:
+        line = self.ignored_reason(item.data(0, PATH_ROLE))
+        item.setData(0, IGNORED_ROLE, line)
+        if line is None:
+            return
+        from ...editor.bidsignore import STANDARD_FOLDERS
+
+        standard = line.rstrip("/") in STANDARD_FOLDERS
+        item.setData(0, COLOR_TOKEN_ROLE, "muted")
+        item.setForeground(0, QColor(pal["muted"]))
+        font = item.font(0)
+        font.setItalic(True)
+        item.setFont(0, font)
+        item.setToolTip(0, "Not validated: every validator ignores this folder."
+                        if standard else
+                        f"Not validated: .bidsignore says {line.strip()}")
+
+    def _ignore_listing(self):
+        from ...editor import bidsignore as bi
+
+        if self._listing is None and self._root is not None:
+            self._listing = bi.list_dataset(self._root)
+        return self._listing
+
+    def _add_ignore_entries(self, menu: QMenu, scope: list[Path], *,
+                            heading=None) -> bool:
+        """Ignore in validation / Stop ignoring, for what the click covers,
+        after ``heading()`` when anything is added. True when anything was."""
+        from ...editor import bidsignore as bi
+        from ..combo_popup import round_menu
+
+        rels: list[str] = []
+        for p in scope:
+            try:
+                rel = Path(p).relative_to(self._root).as_posix()
+            except ValueError:
+                continue
+            if rel in ("", "."):
+                continue
+            folder = Path(p).is_dir() and not _is_folder_recording(Path(p).name)
+            rels.append(rel + "/" if folder else rel)
+        if not rels:
+            return False
+        listing = self._ignore_listing()
+        if listing is None:
+            return False
+        stop = bi.stop_choices(rels, listing.paths, self._root)
+        all_ignored = all(self.ignored_reason(self._root / r.rstrip("/")) for r in rels)
+        choices = [] if all_ignored else bi.choices_for(rels, listing.paths)
+        if not (choices or stop or all_ignored):
+            return False
+        if heading is not None:
+            heading()
+        added = False
+        if not all_ignored:
+            if choices:
+                sub = menu.addMenu("Ignore in validation")
+                round_menu(sub)
+                sub.setToolTipsVisible(True)
+                for choice in choices:
+                    files = f"{choice.files} file" + ("" if choice.files == 1 else "s")
+                    action = sub.addAction(f"{choice.label}\t{files}")
+                    action.setToolTip("Adds " + ", ".join(choice.patterns)
+                                      + " to .bidsignore. One step in the Editor's "
+                                      "history, so it can be undone.")
+                    action.triggered.connect(
+                        lambda _c=False, c=choice: self.ignore_requested.emit(c))
+                sub.addSeparator()
+                sub.addAction("Ignored files...").triggered.connect(
+                    lambda _c=False: self.ignore_list_requested.emit())
+                added = True
+        if stop:
+            # Everything picked in one step first; removing a wider line, which
+            # brings back more than was picked, offered beside it.
+            first = stop[0] if stop[0].key == "stop" else None
+            rest = stop[1:] if first is not None else stop
+            if first is not None:
+                action = menu.addAction(first.label)
+                action.setToolTip(_stop_tip(first))
+                action.triggered.connect(
+                    lambda _c=False, c=first: self.unignore_requested.emit(c))
+            if len(rest) == 1 and first is None:
+                action = menu.addAction(rest[0].label)
+                action.setToolTip("Removes the line from .bidsignore: everything it hides "
+                                  "is validated again.")
+                action.triggered.connect(
+                    lambda _c=False, c=rest[0]: self.unignore_requested.emit(c))
+            elif rest:
+                sub = menu.addMenu("Stop ignoring" if first is None
+                                   else "Remove a line instead")
+                round_menu(sub)
+                for choice in rest:
+                    sub.addAction(choice.label).triggered.connect(
+                        lambda _c=False, c=choice: self.unignore_requested.emit(c))
+            added = True
+        elif all_ignored:
+            # Ignored by the standard (sourcedata/, code/): nothing to remove.
+            note = menu.addAction("Not validated (the standard ignores it)")
+            note.setEnabled(False)
+            added = True
+        return added
 
     def _fill_level(self, parent_item: QTreeWidgetItem) -> None:
         """Draw the contents of one folder, with the next level stubbed."""
@@ -735,7 +980,7 @@ class BidsTreePane(QWidget):
                 continue
             is_dir = entry.is_dir()
             item = QTreeWidgetItem([entry.name])
-            token = _color_token_for(entry.name, is_dir)
+            token = color_token_for(entry.name, is_dir=is_dir)
             item.setData(0, PATH_ROLE, entry.path)
             item.setData(0, COLOR_TOKEN_ROLE, token)
             item.setData(0, IS_DIR_ROLE, is_dir)
@@ -747,6 +992,7 @@ class BidsTreePane(QWidget):
                 item.setForeground(0, QColor(pal["muted"]))
             else:
                 item.setForeground(0, QColor(pal[token]))
+                self._mark_ignored(item, pal)
             item.setIcon(0, icons.icon_for_path(entry.name, is_dir=is_dir))
             parent_item.addChild(item)
             if is_dir and not _is_folder_recording(entry.name):
@@ -945,9 +1191,9 @@ class BidsTreePane(QWidget):
         """
         # Build a normalised lookup (string form) so we don't have to
         # construct ``Path`` for every tree item.
-        leaf_map = {_norm_path(p): s for p, s in severities.items()}
+        leaf_map = {self._key(str(p)): s for p, s in severities.items()}
         count_map = {
-            _norm_path(p): (int(c[0]), int(c[1]))
+            self._key(str(p)): (int(c[0]), int(c[1]))
             for p, c in (counts or {}).items()
         }
         # Remember so a live (watcher-driven) refresh can re-stamp the rebuilt
@@ -955,6 +1201,25 @@ class BidsTreePane(QWidget):
         self._last_badges = dict(leaf_map)
         self._last_counts = dict(count_map)
         self._apply_badge_map(leaf_map, count_map)
+
+    def update_badges(
+        self,
+        severities: dict[Path, str],
+        counts: Optional[dict[Path, tuple[int, int]]] = None,
+    ) -> None:
+        """Change the badges of SOME files (a re-validated file merged in),
+        keeping everyone else's, and roll the folders up again. Restamping
+        the whole tree for one file was most of a one-file re-validation."""
+        counts = counts or {}
+        for path, severity in severities.items():
+            key = self._key(str(path))
+            self._last_badges[key] = severity
+            found = counts.get(path)
+            if found and (found[0] or found[1]):
+                self._last_counts[key] = (int(found[0]), int(found[1]))
+            else:
+                self._last_counts.pop(key, None)
+        self._apply_badge_map(self._last_badges, self._last_counts)
 
     def _apply_badge_map(
         self,
@@ -985,12 +1250,30 @@ class BidsTreePane(QWidget):
         # Force the delegate to repaint with the new badge data.
         self._tree.viewport().update()
 
+    def _key(self, path_str: str) -> str:
+        """The comparable form of a path: the root resolved once, the rest a
+        string replacement. Resolving every row (and every report path) cost
+        64,000 ``resolve`` calls when a 21,663-file report arrived."""
+        root = self._root
+        if root is not None:
+            given = str(root)
+            if path_str == given or path_str.startswith(given + os.sep):
+                resolved = getattr(self, "_root_resolved", None)
+                if resolved is None or resolved[0] != given:
+                    self._root_resolved = (given, _norm_path(given))
+                return self._root_resolved[1] + path_str[len(given):]
+            resolved = getattr(self, "_root_resolved", None)
+            if resolved is not None and (path_str == resolved[1]
+                                         or path_str.startswith(resolved[1] + os.sep)):
+                return path_str
+        return _norm_path(path_str)
+
     def _stamp_badge(self, item: QTreeWidgetItem) -> None:
         """Put the badge and finding counts on one row, from the cached maps."""
         path_str = item.data(0, PATH_ROLE)
         if not path_str:
             return
-        key = _norm_path(path_str)
+        key = self._key(path_str)
         if item.data(0, IS_DIR_ROLE):
             badge = self._dir_badges.get(key)
             errors, warnings = self._dir_counts.get(key, (0, 0))
@@ -1121,11 +1404,24 @@ class BidsTreePane(QWidget):
             compare_images.triggered.connect(
                 lambda _c=False, s=images[:2]: self.compare_requested.emit(s)
             )
+            base = self.overlay_base(images[0]) if (
+                self.overlay_base is not None and not pair) else None
+            if base is not None:
+                over = menu.addAction(f"Draw over {base.name}")
+                over.setToolTip(
+                    "Put this image over the one you were looking at: an atlas, "
+                    "a mask or a statistical map, resliced onto its grid."
+                )
+                over.triggered.connect(
+                    lambda _c=False, o=images[0], b=base: self.overlay_requested.emit(o, b)
+                )
 
         # References, offered only where a link field is worth having: on a
         # fieldmap, an MEG recording, a derivative. Offering it on every
         # file would be true and useless.
-        if self._root is not None and clicked_path.is_file():
+        # A folder open for viewing offers only what reads: comparing, and the
+        # path. Every tool below writes.
+        if self._root is not None and clicked_path.is_file() and not self.read_only:
             from ...editor import linkage as lk
             if lk.fields_for(self._root, clicked_path):
                 menu_section(menu, "Check and repair")
@@ -1141,11 +1437,60 @@ class BidsTreePane(QWidget):
                         self.links_requested.emit([p])
                 )
 
+        # A sidecar written from the recording: on any file BIDS Manager can
+        # read (a BIDS name or not), on a sidecar, or on a folder. In a folder
+        # open view only it is shown greyed, saying why: nothing is written
+        # into such a folder, and an entry that simply is not there reads as
+        # "this file cannot have a sidecar".
+        if self._root is not None and _can_delete(clicked_path, self._root):
+            picked = self.selected_paths()
+            sidecar_scope = (picked if clicked_path in picked and len(picked) > 1
+                             else [clicked_path])
+            entry = _sidecar_entry(self._root, sidecar_scope)
+            if entry is not None:
+                text, complete = entry
+                if not any(a.text() == "CHECK AND REPAIR" for a in menu.actions()):
+                    menu_section(menu, "Check and repair")
+                sidecars = menu.addAction(text)
+                if self.read_only:
+                    sidecars.setEnabled(False)
+                    sidecars.setToolTip(
+                        "This folder is open view only, so nothing is written into "
+                        "it. Open it as a project (the path bar above) to write "
+                        "sidecars here."
+                    )
+                else:
+                    sidecars.setToolTip(
+                        "From the data it was converted from, its own header, your "
+                        "answers and the sidecars that link to it, in the format of "
+                        "the BIDS version chosen in Settings. A file that is not "
+                        "named the BIDS way gets its sidecar beside it. A value "
+                        "already there is never changed; every field is shown with "
+                        "where it was read before anything is written. One Undo."
+                    )
+                    sidecars.triggered.connect(
+                        lambda _c=False, s=sidecar_scope, c=complete:
+                            self.sidecars_requested.emit(s, c)
+                    )
+
+        # What validation reads: anything under the root but the tool's own
+        # folders. A right-click inside the selection covers the selection.
+        if (self._root is not None and not self.read_only
+                and _can_delete(clicked_path, self._root)):
+            picked = self.selected_paths()
+            ignore_scope = (picked if clicked_path in picked and len(picked) > 1
+                            else [clicked_path])
+            have = any(a.text() == "CHECK AND REPAIR" for a in menu.actions())
+            self._add_ignore_entries(
+                menu, ignore_scope,
+                heading=None if have else lambda: menu_section(menu, "Check and repair"))
+
         # Every entity the clicked row actually carries, so the menu offers
         # renaming exactly what is in front of the user. A folder named
         # sub-01 offers the subject; a func file offers task, run and echo.
-        renames = _renameable_entities(Path(path))
-        if renames or _can_restructure(Path(path)):
+        renames = [] if self.read_only else _renameable_entities(Path(path))
+        restructure = not self.read_only and _can_restructure(Path(path))
+        if renames or restructure:
             menu_section(menu, "Names and structure")
         if renames:
             for entity, value, label in renames:
@@ -1168,7 +1513,7 @@ class BidsTreePane(QWidget):
         chosen = self.selected_paths()
         clicked = Path(path)
         scope = chosen if clicked in chosen and len(chosen) > 1 else [clicked]
-        if _can_restructure(clicked):
+        if restructure:
             add_entity = menu.addAction("Add or change an entity...")
             add_entity.setToolTip(
                 "Give these files an entity the schema allows them, placed "
@@ -1247,10 +1592,26 @@ class BidsTreePane(QWidget):
                 lambda _c=False, s=scope: self.deface_revert_requested.emit(s)
             )
 
+            anonymise = menu.addAction("Anonymise metadata...")
+            anonymise.setToolTip(
+                "Remove what identifies a participant from the metadata of these "
+                "subjects or sessions, by purpose. Every change is shown first; one "
+                "undoable step."
+            )
+            anonymise.triggered.connect(
+                lambda _c=False, s=scope: self.anonymise_requested.emit(s)
+            )
+
+        # Anything shown in the dataset can be offered for deletion, not only
+        # what is under a subject: an empty folder anywhere is worth removing.
+        # The engine still refuses the root, the tool's own folder and
+        # dataset_description.json, and says why.
+        if not self.read_only and _can_delete(clicked, self._root):
             menu_section(menu, "Remove")
             what = (
                 f"{len(scope)} items" if len(scope) > 1
-                else ("this folder and everything in it" if clicked.is_dir()
+                else ("this empty folder" if clicked.is_dir() and _hollow_tree(clicked)
+                      else "this folder and everything in it" if clicked.is_dir()
                       else "this recording")
             )
             delete = menu.addAction(f"Delete {what}...")
