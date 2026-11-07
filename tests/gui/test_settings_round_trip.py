@@ -193,3 +193,18 @@ def test_the_colour_app_icon_is_the_default_header_logo(isolated_settings):
     store.setValue(KEYS["header_logo"], "mark")
     store.sync()
     assert AppSettings.load().header_logo == "mark"
+
+
+def test_the_installed_interpreter_is_written_on_its_own(isolated_settings):
+    """The install finishes while Settings is open, so only ``ai_python``
+    is written: the rest of the page has not been saved yet, and a full
+    save here would put back the copy the dialog loaded at open time."""
+    store = QSettings(str(isolated_settings), QSettings.Format.IniFormat)
+    store.setValue(KEYS["active_view"], "editor")
+
+    AppSettings.remember_ai_python("  C:/agent/.venv/python.exe  ")
+    store.sync()
+
+    assert AppSettings.load().ai_python == "C:/agent/.venv/python.exe"
+    # The remember touches nothing else in the store.
+    assert store.value(KEYS["active_view"]) == "editor"

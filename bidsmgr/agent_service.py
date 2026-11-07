@@ -72,6 +72,61 @@ REQUIRED_MODULES = ("flask", "torch", "transformers", "laya")
 #: and a first run may also be pulling a model into the cache.
 START_TIMEOUT = 90.0
 
+#: Where downloaded models live, when the GUI has not said otherwise:
+#: the per-user application data folder, the same place Qt's
+#: ``QStandardPaths.AppLocalDataLocation`` resolves for this app
+#: (``%LOCALAPPDATA%\\bidsmgr\\bidsmgr\\models`` on Windows,
+#: ``~/Library/Application Support/bidsmgr/models`` on macOS,
+#: ``~/.local/share/bidsmgr/models`` on Linux). Models are multi-GB
+#: data owned by the *user* of a machine, not of an installation, so
+#: they belong next to their other per-user files rather than inside a
+#: read-only install directory or the hidden Hugging Face default.
+_MODELS_DIR_NAME = "models"
+
+#: The agent (and huggingface_hub inside it) read the cache location at
+#: import time, so it is set in the environment at spawn; this name also
+#: lets the agent report where its models live.
+HUB_CACHE_ENV = "HF_HUB_CACHE"
+
+#: Set alongside so anything the agent runs can find the folder by name.
+MODELS_DIR_ENV = "BIDS_AGENT_MODELS_DIR"
+
+
+def default_data_dir() -> Path:
+    """The per-user application data folder, as QStandardPaths would
+    resolve it.
+
+    Stdlib only, and shaped exactly like
+    ``QStandardPaths.AppLocalDataLocation`` for this app's organisation
+    and name: Qt puts the organisation in the path on Windows only. The
+    models and the AI chat logs are both folders inside it.
+    """
+    home = Path.home()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        if not base:
+            base = str(home / "AppData" / "Local")
+        return Path(base) / "bidsmgr" / "bidsmgr"
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "bidsmgr"
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if not data_home:
+        data_home = str(home / ".local" / "share")
+    return Path(data_home) / "bidsmgr"
+
+
+def default_models_dir() -> Path:
+    """The per-user models folder: the application data folder + models."""
+    return default_data_dir() / _MODELS_DIR_NAME
+
+
+def models_dir(override: str = "") -> Path:
+    """Where models are kept: the GUI's stored choice when it has one,
+    else the per-user default. ``~`` is expanded, so a hand-typed path
+    means the home folder rather than a folder named ``~``."""
+    stripped = (override or "").strip()
+    return Path(stripped).expanduser() if stripped else default_models_dir()
+
 #: Probe interpreter candidates with this; it never imports the heavy
 #: modules, so it costs a process start and nothing more.
 _PROBE_PY = (
@@ -369,12 +424,16 @@ class AgentService:
         self,
         *,
         python: str = "",
+        models_dir: str = "",
         on_ready: Optional[Callable[[], None]] = None,
     ) -> None:
         """Bring the agent up in the background. Never raises, never blocks.
 
         Returns immediately; poll :attr:`state` (the Settings tab does,
-        four times a second) or use :meth:`wait_running`.
+        four times a second) or use :meth:`wait_running`. ``models_dir``
+        is where downloaded models live: it is set in the agent's
+        environment at spawn, which is how the models folder is chosen
+        without the agent knowing about the GUI.
         """
         with self._lock:
             if self._state in ("starting", "running"):
@@ -385,7 +444,7 @@ class AgentService:
             self._detail = "Starting the AI agent..."
         threading.Thread(
             target=self._run,
-            args=(generation, python, on_ready),
+            args=(generation, python, models_dir, on_ready),
             name="bidsmgr-ai-agent",
             daemon=True,
         ).start()
@@ -452,6 +511,7 @@ class AgentService:
         self,
         generation: int,
         hint: str,
+        models_dir: str,
         on_ready: Optional[Callable[[], None]],
     ) -> None:
         log_path = _log_path()
@@ -482,16 +542,18 @@ class AgentService:
 
             if not (AGENT_DIR / "main.py").is_file():
                 raise _Failure(
-                    "The AI agent's code was not found at\n"
+                    "The AI Agent module is not installed at\n"
                     f"    {AGENT_DIR}\n"
-                    "Reinstall BIDS-Manager, or copy bids-ai-agent there."
+                    "Open Settings -> AI Agent and choose Install — the app "
+                    "clones the agent's repository and sets up its "
+                    "dependencies for you."
                 )
 
             exe = resolve_python(hint)
             if exe is None:
                 raise _Failure(_no_python_message(hint))
 
-            proc = self._spawn(exe, port, log_path, generation)
+            proc = self._spawn(exe, port, log_path, generation, models_dir)
             if proc is None:
                 return                     # stopped underneath us
             self._await_serving(
@@ -518,11 +580,21 @@ class AgentService:
         port: int,
         log_path: Path,
         generation: int,
+        models_folder: str = "",
     ) -> Optional[subprocess.Popen]:
         env = dict(os.environ)
         env["BIDS_AGENT_PORT"] = str(port)
         env["BIDS_AGENT_HOST"] = HOST
         env.setdefault("PYTHONUNBUFFERED", "1")
+        # Where downloaded models live. huggingface_hub reads the cache
+        # location at import time, so it has to be in the environment
+        # before the agent starts; the models-folder name is set alongside
+        # so the agent can report (and anything it runs can find) the
+        # folder by name. Named ``models_folder`` so it does not shadow
+        # the :func:`models_dir` resolver above.
+        hub = models_dir(models_folder)
+        env[HUB_CACHE_ENV] = str(hub)
+        env[MODELS_DIR_ENV] = str(hub)
 
         try:
             handle = open(log_path, "w", encoding="utf-8", errors="replace")
@@ -614,11 +686,16 @@ __all__ = [
     "AGENT_DIR",
     "AgentService",
     "DEFAULT_PORT",
+    "HUB_CACHE_ENV",
     "HOST",
+    "MODELS_DIR_ENV",
     "REQUIRED_MODULES",
     "START_TIMEOUT",
+    "default_data_dir",
+    "default_models_dir",
     "default_url",
     "free_port",
+    "models_dir",
     "port_is_free",
     "probe",
     "resolve_python",

@@ -17,9 +17,11 @@ page lays the post-convert chain out as an indented hierarchy (parent step
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -39,6 +41,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -49,13 +52,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import agent_installer
 from .. import agent_service
 from .. import schema
+from ..ai_chat_log import logs_dir
 from ..classifier import sequence_dict
 from ..deface import engines as deface_engines
 from ..deface import run as deface_run
 from ..classifier import user_rules
 from ..util.system_info import SystemInfo, get_system_info
+from .ai_install_panel import AiInstallPanel
 from .app_settings import AI_DEVICE_MAPS, AI_QUANTIZATIONS, AppSettings
 from .typefaces import code
 
@@ -93,10 +99,29 @@ _DEVICE_LABELS = {
     "mps": "Apple GPU (MPS)",
 }
 _QUANT_LABELS = {
-    "none": "Full precision (16-bit, exactly as published)",
-    "4bit": "4-bit (about a quarter of the memory)",
-    "8bit": "8-bit (about half the memory)",
+    "none": "Default",
+    "4bit": "4-bit",
+    "8bit": "8-bit",
 }
+
+#: Flags appended to a model's name in the Model dropdown. The icon goes
+#: at the end of the row: a leading glyph reads as part of the repo id,
+#: and the name is what the row is for. ``✔`` is downloaded and ready to
+#: use offline; ``⬇`` is a download that was started and not finished.
+_MODEL_READY_MARK = "  ✔"
+_MODEL_PARTIAL_MARK = "  ⬇"
+
+
+def _human_bytes(n: int) -> str:
+    """Bytes as a person reads them: KB, MB, GB."""
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{n} B"
 
 
 class SettingsDialog(QDialog):
@@ -1437,12 +1462,30 @@ class SettingsDialog(QDialog):
         is worse than no field at all. What is left is the state of the
         service, the interpreter to run it with, and the model knobs a
         normal user can act on.
+
+        The agent's code is not shipped inside the app: when it is
+        missing, the page asks whether to install it (the panel clones
+        the agent's repository and sets up its dependencies) and the
+        knobs below wait until it is there.
         """
         w = QWidget()
         v = QVBoxLayout(w)
 
+        # The first-run ask, shown instead of the knobs while the
+        # module is missing. Built either way and shown/hidden, so a
+        # finished install can swap straight to the normal page.
+        self._ai_install_panel = AiInstallPanel()
+        self._ai_install_panel.installed.connect(self._on_agent_installed)
+        v.addWidget(self._ai_install_panel)
+
         box = QGroupBox("AI Agent")
         form = QFormLayout(box)
+        # The page holds the widest rows in the dialog: a model dropdown
+        # with a Download button beside it, and two folder paths each with
+        # Browse and Open. Wrapping a row that does not fit is what keeps
+        # the page readable in a narrow window instead of cutting the
+        # rightmost button off.
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         self._ai_enabled = QCheckBox(
             "Show an “Ask AI” button on errors and warnings"
@@ -1498,19 +1541,131 @@ class SettingsDialog(QDialog):
         form.addRow("Python:", python_row)
 
         # -- which model ----------------------------------------------
+        model_row = QHBoxLayout()
+        model_row.setSpacing(8)
         self._ai_model = QComboBox()
         self._ai_model.setEditable(False)
-        self._ai_model.setToolTip(
+        # The rows are names only: a description, a parameter count and a
+        # VRAM figure on one line made the list unreadable (and wider
+        # than the dialog). Everything else is the item's tooltip.
+        self._ai_model_hint = (
             "The local model that writes the answers.\n\n"
-            "Populated from the agent's own model list; \"as configured "
-            "on the agent\" means BIDS-Manager has no preference and the "
-            "agent's config.json decides.\n\n"
-            "The list is fetched when you open this tab and after "
-            "<b>Test connection</b>. Downloading a model is the agent's "
-            "job and can take a while the first time."
+            "Hover a model for its description, size and memory use.\n\n"
+            "A ✔ at the end of a name marks a model that is downloaded "
+            "and ready to use offline; a ⬇ marks one whose download was "
+            "started but not finished — press Download to resume it. "
+            "Unmarked models download on first use, with a progress bar."
         )
-        self._ai_model.addItem("— as configured on the agent —", "")
-        form.addRow("Model:", self._ai_model)
+        self._ai_model.setToolTip(self._ai_model_hint)
+        self._ai_model.setPlaceholderText(
+            "No models yet — start the agent to list them"
+        )
+        self._ai_model.currentIndexChanged.connect(self._show_model_tooltip)
+        model_row.addWidget(self._ai_model, 1)
+        self._ai_download_btn = QPushButton("Download")
+        self._ai_download_btn.setToolTip(
+            "Download the selected model now, into the models folder "
+            "below, with a progress bar. A model downloaded here is "
+            "ready to use; one that is not downloaded yet is fetched "
+            "automatically the first time you ask the agent something."
+        )
+        self._ai_download_btn.clicked.connect(self._download_selected_model)
+        model_row.addWidget(self._ai_download_btn, 0)
+        form.addRow("Model:", model_row)
+
+        # Progress of a model download started here: hidden until one
+        # runs, then bytes out of bytes, polled from the agent.
+        self._ai_download_bar = QProgressBar()
+        self._ai_download_bar.setVisible(False)
+        self._ai_download_bar.setRange(0, 100)
+        # The model the running download is for: the dropdown may change
+        # while bytes arrive, and the poll has to keep reporting this one.
+        self._ai_download_name = ""
+        self._ai_download_info = QLabel("")
+        self._ai_download_info.setWordWrap(True)
+        self._ai_download_info.setStyleSheet("color: #8b949e;")
+        self._ai_download_info.setVisible(False)
+        download_row = QHBoxLayout()
+        download_row.setSpacing(8)
+        download_row.addWidget(self._ai_download_bar, 0)
+        download_row.addWidget(self._ai_download_info, 1)
+        form.addRow("", download_row)
+
+        # -- where models and chat logs live --------------------------
+        # The effective path is filled into the box rather than kept in a
+        # placeholder: "where will the download go?" is answered by the
+        # first thing the user sees, and the same box is where a different
+        # location is typed. Clearing it restores the default.
+        models_dir_row = QHBoxLayout()
+        models_dir_row.setSpacing(8)
+        self._ai_models_dir = QLineEdit()
+        self._ai_models_dir.setPlaceholderText(str(agent_service.models_dir()))
+        self._ai_models_dir.setToolTip(
+            "Where downloaded models are saved, one folder per model in "
+            "the standard Hugging Face layout. The box starts with the "
+            "folder currently in use.\n\n"
+            "Clear it for the default: your per-user application data "
+            "folder, which is where multi-gigabyte files belong — "
+            "surviving updates, per user, without admin rights.\n\n"
+            "A model copied into this folder by hand (or fetched by any "
+            "Hugging Face tool) is a model this app can use, and "
+            "everything downloaded through the GUI lands here too.\n\n"
+            "Changing it takes effect the next time the agent starts."
+        )
+        models_browse_btn = QPushButton("Browse…")
+        models_browse_btn.setToolTip("Choose another folder for models.")
+        models_browse_btn.clicked.connect(
+            lambda: self._browse_folder(
+                self._ai_models_dir, "Choose where models are saved",
+            )
+        )
+        models_dir_btn = QPushButton("Open folder")
+        models_dir_btn.setToolTip(
+            "Open the models folder in your file manager, so a model can "
+            "be copied in by hand or its folder inspected."
+        )
+        models_dir_btn.clicked.connect(self._open_models_folder)
+        models_dir_row.addWidget(self._ai_models_dir, 1)
+        models_dir_row.addWidget(models_browse_btn, 0)
+        models_dir_row.addWidget(models_dir_btn, 0)
+        form.addRow("Models saved in:", models_dir_row)
+
+        # -- where the conversations are written down ------------------
+        chat_log_row = QHBoxLayout()
+        chat_log_row.setSpacing(8)
+        self._ai_chat_log_dir = QLineEdit()
+        self._ai_chat_log_dir.setPlaceholderText(str(logs_dir("")))
+        self._ai_chat_log_dir.setToolTip(
+            "Where the AI window's conversations are saved: one JSONL "
+            "file per finding, holding each question, each answer and how "
+            "that answer was produced (model, seconds, tokens, intent and "
+            "the full prompt). The box starts with the folder currently "
+            "in use.\n\n"
+            "Clear it for the default: a chat-logs folder beside the "
+            "models, in your per-user application data folder.\n\n"
+            "A change takes effect with the next question. Nothing is "
+            "sent anywhere; these are local files.\n\n"
+            "The agent's own process log — startup messages and request "
+            "errors, never the conversation — is a separate file, "
+            "bidsmgr-ai-agent.log, in your temporary folder."
+        )
+        chat_log_browse_btn = QPushButton("Browse…")
+        chat_log_browse_btn.setToolTip("Choose another folder for chat logs.")
+        chat_log_browse_btn.clicked.connect(
+            lambda: self._browse_folder(
+                self._ai_chat_log_dir, "Choose where chat logs are saved",
+            )
+        )
+        chat_log_open_btn = QPushButton("Open folder")
+        chat_log_open_btn.setToolTip(
+            "Open the chat-log folder in your file manager, so the "
+            "conversations can be read, searched or copied."
+        )
+        chat_log_open_btn.clicked.connect(self._open_chat_logs_folder)
+        chat_log_row.addWidget(self._ai_chat_log_dir, 1)
+        chat_log_row.addWidget(chat_log_browse_btn, 0)
+        chat_log_row.addWidget(chat_log_open_btn, 0)
+        form.addRow("Chat logs saved in:", chat_log_row)
 
         # -- how much it is allowed to write ---------------------------
         self._ai_tokens = QSpinBox()
@@ -1533,14 +1688,13 @@ class SettingsDialog(QDialog):
             self._ai_quant.addItem(_QUANT_LABELS[value], value)
         self._ai_quant.setToolTip(
             "How the model's weights are held while it runs.\n\n"
-            "Full precision means <b>16-bit</b>: these models are "
-            "published as 16-bit weights, so this loads them exactly as "
-            "they are — it is not 32-bit, and going to 32-bit would "
-            "double the memory for nothing.\n\n"
+            "<b>Default</b> loads the model as it was published: no "
+            "compression, and no extra memory spent on a wider format "
+            "than the model ships with.\n\n"
             "4-bit uses about a quarter of the memory and 8-bit about "
             "half, at some cost in answer quality. Both need "
-            "bitsandbytes; without it the agent warns and loads full "
-            "precision instead.\n\n"
+            "bitsandbytes; without it the agent warns and loads the "
+            "default instead.\n\n"
             "Quantizing is paid once, when the model is loaded — a few "
             "extra seconds — and never on an individual answer. After "
             "that it is faster, not slower.\n\n"
@@ -1644,7 +1798,10 @@ class SettingsDialog(QDialog):
             "machine, so the first answer of a session takes a moment.\n\n"
             "Asking sends the finding &mdash; rule id, field, message and "
             "file path &mdash; to that service; nothing leaves your "
-            "machine. Its own README lists what it needs installed."
+            "machine. The module is installed from its own GitHub "
+            "repository the first time you use this page, and downloaded "
+            "models live in the models folder above. Conversations are "
+            "written to the chat-log folder above, one file per finding."
         )
         note.setStyleSheet("color: #8b949e;")
         note.setTextFormat(Qt.TextFormat.RichText)
@@ -1656,11 +1813,43 @@ class SettingsDialog(QDialog):
         # is polled rather than pushed: a status that only refreshed on
         # an event would go stale the moment a background start finished.
         self._ai_models_fetched = False
+        # Set when an install started from this dialog is waiting for the
+        # agent: the model list is fetched once more when the service
+        # reports it is up (asking at install time is too early).
+        self._ai_waiting_for_agent = False
+        # What the last poll saw, so the list is fetched on the moment the
+        # agent comes up — opening the tab while torch is still importing
+        # used to leave the dropdown empty until the page was left and
+        # entered again.
+        self._ai_last_state = ""
+        # What the models folder holds, kept for the moment the agent is
+        # not reachable: the dropdown still lists (and flags) what is on
+        # disk then.
+        self._ai_ready_models: set[str] = set()
+        self._ai_partial_models: set[str] = set()
         self._ai_timer = QTimer(self)
         self._ai_timer.setInterval(400)
         self._ai_timer.timeout.connect(self._update_agent_status)
         self._ai_timer.start()
         self.finished.connect(self._ai_timer.stop)
+
+        # Progress of a download started from the Download button: one
+        # poll of the agent's status endpoint, stopped once a poll says
+        # the fetch is over.
+        self._ai_download_timer = QTimer(self)
+        self._ai_download_timer.setInterval(700)
+        self._ai_download_timer.timeout.connect(self._poll_model_download)
+        self.finished.connect(self._ai_download_timer.stop)
+
+        # The ask replaces the knobs while the module is missing, which
+        # on a first run is exactly the state of this page.
+        if agent_installer.installed():
+            self._ai_install_panel.hide()
+        else:
+            box.hide()
+            note.hide()
+        self._ai_box = box
+        self._ai_note = note
         self._update_agent_status()
         return w
 
@@ -1678,6 +1867,11 @@ class SettingsDialog(QDialog):
             return
         if self._page_titles[index] != "AI Agent":
             return
+        # The ask is the page's whole content while the module is
+        # missing; there is nothing to fetch from an agent that cannot
+        # start, so the knobs wait until it is installed.
+        if not agent_installer.installed():
+            return
         # Retried until it works: opening the tab while the agent is
         # still importing torch is the likeliest moment for this to
         # fail, and a one-shot flag would leave the user staring at a
@@ -1690,6 +1884,8 @@ class SettingsDialog(QDialog):
         """One poll of ``bidsmgr.agent_service`` into label + button."""
         svc = agent_service.service()
         state = svc.state
+        previous = self._ai_last_state
+        self._ai_last_state = state
         if state == "running":
             owned = svc.owned
             self._ai_status.setText(
@@ -1718,6 +1914,18 @@ class SettingsDialog(QDialog):
             self._ai_start_btn.setText("Start")
             self._ai_start_btn.setEnabled(True)
         self._ai_status.setToolTip(svc.detail)
+        # An install from this dialog starts the agent and then asks for
+        # the model list far too early to get an answer. The same is true
+        # of opening the page while torch is still importing: the first
+        # moment the service says it is serving, the list is fetched once
+        # more, so the dropdown (and its ✔ marks) fill without the user
+        # leaving and re-entering the page.
+        if state == "running" and (
+            self._ai_waiting_for_agent
+            or (previous != "running" and not self._ai_models_fetched)
+        ):
+            self._ai_waiting_for_agent = False
+            self._refresh_agent_models()
 
     def _on_agent_start_stop(self) -> None:
         svc = agent_service.service()
@@ -1728,7 +1936,10 @@ class SettingsDialog(QDialog):
         # Read the interpreter straight from the box rather than from
         # settings: the user may have typed it two seconds ago and not
         # saved yet, and this is the button that acts on what they see.
-        svc.start(python=self._ai_python.text().strip())
+        svc.start(
+            python=self._ai_python.text().strip(),
+            models_dir=self._ai_models_dir.text().strip(),
+        )
         self._update_agent_status()
 
     def _browse_agent_python(self) -> None:
@@ -1745,6 +1956,222 @@ class SettingsDialog(QDialog):
         if path:
             self._ai_python.setText(path)
 
+    def _on_agent_installed(self, python: str) -> None:
+        """The installer finished: swap to the normal page and start it.
+
+        The interpreter the installer built is put straight into the
+        Python box (and saved with the next Save), so the service starts
+        on the environment that was just prepared rather than hoping the
+        auto-detect would find it.
+        """
+        self._ai_install_panel.hide()
+        self._ai_box.show()
+        self._ai_note.show()
+        self._ai_python.setText(python)
+        # Only the interpreter is written: the rest of the page has not
+        # been saved yet, and a full save here would persist the copy
+        # the dialog loaded at open time over anything changed since.
+        type(self._settings).remember_ai_python(python)
+        # Ready means serving: bring it up now on the interpreter that
+        # was just built, and fetch the model list once it answers.
+        svc = agent_service.service()
+        if svc.state in ("stopped", "failed"):
+            # The list below cannot answer yet on a just-started agent;
+            # the 400 ms status poll fetches it once it is serving.
+            self._ai_waiting_for_agent = True
+            svc.start(
+                python=python,
+                models_dir=self._ai_models_dir.text().strip(),
+            )
+        self._refresh_agent_models()
+
+    def _browse_folder(self, field: QLineEdit, title: str) -> None:
+        """Ask for a folder and put it in *field*; cancel changes nothing."""
+        start = field.text().strip()
+        if not os.path.isdir(start):
+            start = os.path.expanduser("~")
+        chosen = QFileDialog.getExistingDirectory(self, title, start)
+        if chosen:
+            field.setText(chosen)
+            # Paths read from the start: the drive and the folders that
+            # identify them are there, the leaf is not.
+            field.setCursorPosition(0)
+
+    @staticmethod
+    def _stored_folder(field: QLineEdit, default: Path) -> str:
+        """What to save for a folder box: "" when it still holds the
+        default, so a machine's own path is not baked into the settings
+        and a later change of default is followed."""
+        text = field.text().strip()
+        if not text:
+            return ""
+        same = (
+            os.path.normcase(os.path.normpath(os.path.expanduser(text)))
+            == os.path.normcase(os.path.normpath(str(default)))
+        )
+        return "" if same else text
+
+    def _open_models_folder(self) -> None:
+        """Open the models folder in the file manager.
+
+        The folder is created on demand: a user who has never downloaded
+        a model gets an empty folder to copy one into, which is the
+        point of the button.
+        """
+        from .ai_models import models_dir
+
+        path = models_dir(self._ai_models_dir.text().strip())
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_chat_logs_folder(self) -> None:
+        """Open the chat-log folder in the file manager.
+
+        Created on demand like the models folder: on a fresh install the
+        first conversation has not been written yet, and a button that
+        lands nowhere is a button that looks broken.
+        """
+        path = logs_dir(self._ai_chat_log_dir.text().strip())
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _download_selected_model(self) -> None:
+        """Start downloading the selected model, then show its progress.
+
+        The agent does the fetching (it is the process with the model
+        libraries); this only starts it and polls the status endpoint,
+        which answers in bytes — the same progress the Ask AI dialog
+        shows when a question reaches a model that is not there yet.
+        """
+        from .ai_explainer import AgentClient, AgentError, agent_base_url
+
+        name = self._ai_model.currentData() or ""
+        if not name:
+            self._ai_download_info.setStyleSheet("color: #d29922;")
+            self._ai_download_info.setVisible(True)
+            self._ai_download_bar.setVisible(False)
+            self._ai_download_info.setText(
+                "Choose a model from the list first."
+            )
+            return
+        svc = agent_service.service()
+        if not svc.is_running():
+            self._ai_download_info.setStyleSheet("color: #f85149;")
+            self._ai_download_info.setVisible(True)
+            self._ai_download_bar.setVisible(False)
+            self._ai_download_info.setText(
+                "Start the agent first — the download runs in its process."
+            )
+            return
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            client = AgentClient(base_url=agent_base_url(), timeout=15.0)
+            client.download_model(name)
+        except AgentError as exc:
+            self._ai_download_info.setStyleSheet("color: #f85149;")
+            self._ai_download_info.setVisible(True)
+            self._ai_download_bar.setVisible(False)
+            self._ai_download_info.setText(str(exc).splitlines()[0])
+            self._ai_download_info.setToolTip(str(exc))
+            return
+        except Exception as exc:                        # pragma: no cover
+            self._ai_download_info.setStyleSheet("color: #f85149;")
+            self._ai_download_info.setVisible(True)
+            self._ai_download_info.setText(str(exc))
+            return
+        finally:
+            self.unsetCursor()
+        self._ai_download_btn.setEnabled(False)
+        self._ai_download_name = name
+        self._ai_download_info.setStyleSheet("color: #8b949e;")
+        self._ai_download_info.setVisible(True)
+        self._ai_download_bar.setVisible(True)
+        self._ai_download_bar.setRange(0, 0)   # indeterminate until the
+        self._ai_download_info.setText(        # total size is known
+            f"Downloading {name} — the size is being looked up ..."
+        )
+        self._ai_download_timer.start()
+
+    def _poll_model_download(self) -> None:
+        """One poll of the agent's download status into bar + info line."""
+        from .ai_explainer import AgentClient, AgentError, agent_base_url
+
+        # The name the download was started for, not whatever the dropdown
+        # shows now: the user may change it while bytes are arriving.
+        name = self._ai_download_name or (self._ai_model.currentData() or "")
+        try:
+            client = AgentClient(base_url=agent_base_url(), timeout=8.0)
+            status = client.download_status()
+        except AgentError as exc:
+            self._ai_download_timer.stop()
+            self._ai_download_btn.setEnabled(True)
+            self._ai_download_info.setStyleSheet("color: #f85149;")
+            self._ai_download_info.setText(str(exc).splitlines()[0])
+            return
+        except Exception as exc:                        # pragma: no cover
+            self._ai_download_timer.stop()
+            self._ai_download_btn.setEnabled(True)
+            self._ai_download_info.setStyleSheet("color: #f85149;")
+            self._ai_download_info.setText(str(exc))
+            return
+
+        state = str(status.get("status") or "")
+        downloaded = int(status.get("downloaded_bytes") or 0)
+        total = status.get("total_bytes")
+        label = name or str(status.get("name") or "the model")
+        if state == "error":
+            self._ai_download_timer.stop()
+            self._ai_download_btn.setEnabled(True)
+            self._ai_download_bar.setVisible(False)
+            self._ai_download_info.setStyleSheet("color: #f85149;")
+            self._ai_download_info.setText(
+                f"Downloading {label} failed: {status.get('error') or 'unknown error'}"
+            )
+            return
+        if state == "done":
+            self._ai_download_timer.stop()
+            self._ai_download_btn.setEnabled(True)
+            self._ai_download_bar.setVisible(False)
+            self._ai_download_info.setStyleSheet("color: #3fb950;")
+            self._ai_download_info.setText(
+                f"{label} is downloaded and ready to use."
+            )
+            self._refresh_agent_models()
+            return
+        if state == "idle" or (
+            status.get("name") and str(status["name"]) != name
+        ):
+            # The job lives in the agent's process: an empty or other
+            # job's slot means it restarted (or another model took over),
+            # so polling would show a bar at zero forever.
+            self._ai_download_timer.stop()
+            self._ai_download_btn.setEnabled(True)
+            self._ai_download_bar.setVisible(False)
+            self._ai_download_info.setStyleSheet("color: #d29922;")
+            self._ai_download_info.setText(
+                f"Downloading {label} stopped — the AI agent restarted or "
+                "another download replaced it. Press Download to start "
+                "again; bytes already fetched are kept."
+            )
+            return
+        if total:
+            total = int(total)
+            # A percentage bar, not bytes: QProgressBar is an int32, and
+            # a multi-GB model would overflow it. The bytes still read in
+            # the info line, where a person can act on them.
+            pct = min(100, int(100 * downloaded / total)) if total else 0
+            self._ai_download_bar.setRange(0, 100)
+            self._ai_download_bar.setValue(pct)
+            self._ai_download_info.setText(
+                f"Downloading {label} — {_human_bytes(downloaded)} of "
+                f"{_human_bytes(total)} ({pct}%) ..."
+            )
+        else:
+            self._ai_download_bar.setRange(0, 0)
+            self._ai_download_info.setText(
+                f"Downloading {label} — {_human_bytes(downloaded)} so far ..."
+            )
+
     def _refresh_agent_models(self) -> None:
         """Fill the Model dropdown from the agent, and say where it is.
 
@@ -1752,8 +2179,28 @@ class SettingsDialog(QDialog):
         model, and a refused connection on loopback is instant. Runs when
         the tab is opened and again after Test connection, so the list
         cannot drift away from what the agent actually offers.
+
+        When the agent cannot be reached the models folder is listed on
+        its own: what is on disk does not depend on a running agent, and
+        an empty dropdown would hide the ✔ marks the page exists to show.
         """
         from .ai_explainer import AgentClient, AgentError, agent_base_url
+        from .ai_models import (
+            downloaded_model_ids,
+            models_dir,
+            partial_model_ids,
+        )
+
+        # The folder on screen, not the saved one: the marks should
+        # follow the field the user is editing.
+        folder = models_dir(self._ai_models_dir.text().strip())
+        try:
+            ready_on_disk = downloaded_model_ids(folder)
+            partial_on_disk = partial_model_ids(folder)
+        except Exception:                            # pragma: no cover
+            ready_on_disk, partial_on_disk = set(), set()
+        self._ai_ready_models = ready_on_disk
+        self._ai_partial_models = partial_on_disk
 
         url = agent_base_url()
         self.setCursor(Qt.CursorShape.WaitCursor)
@@ -1767,12 +2214,14 @@ class SettingsDialog(QDialog):
                 str(exc).splitlines()[0] or "Connection failed."
             )
             self._ai_test_result.setToolTip(str(exc))
+            self._list_models_on_disk()
             return
         except Exception as exc:                        # pragma: no cover
             self._ai_models_fetched = False
             self._ai_test_result.setStyleSheet("color: #f85149;")
             self._ai_test_result.setText(str(exc))
             self._ai_test_result.setToolTip(repr(exc))
+            self._list_models_on_disk()
             return
         finally:
             self.unsetCursor()
@@ -1780,6 +2229,15 @@ class SettingsDialog(QDialog):
         self._ai_models_fetched = True
         models = info.get("models") if isinstance(info, dict) else None
         models = [m for m in (models or []) if isinstance(m, dict) and m.get("name")]
+
+        # Which models are downloaded. The agent lists its own cache and
+        # the folder on screen is scanned as well: an older agent sends
+        # no flags at all, and one started outside BIDS-Manager may be
+        # reading a different cache from the folder this app gives it.
+        downloaded = ready_on_disk | {
+            str(m["name"]) for m in models if m.get("downloaded") is True
+        }
+        self._ai_ready_models = downloaded
 
         # What the agent is actually running, which is also what we
         # should have selected when the user never chose anything.
@@ -1811,28 +2269,105 @@ class SettingsDialog(QDialog):
 
         chosen = self._ai_model.currentData() or ""
         self._ai_model.clear()
-        self._ai_model.addItem("— as configured on the agent —", "")
         for entry in models:
             name = str(entry["name"])
-            label = f"{name}  ·  {entry.get('description', '')}"
-            if entry.get("size"):
-                label += f"  ·  {entry['size']}"
-            if entry.get("vram_gb"):
-                label += f"  ·  {entry['vram_gb']}"
-            self._ai_model.addItem(label, name)
+            self._add_model_item(
+                name,
+                description=str(entry.get("description") or ""),
+                size=str(entry.get("size") or ""),
+                vram=str(entry.get("vram_gb") or ""),
+                ready=name in downloaded,
+                partial=name in partial_on_disk,
+            )
+        self._ai_model.setPlaceholderText(
+            "The agent listed no models"
+            if not models else
+            "No models yet — start the agent to list them"
+        )
         self._set_agent_model(chosen or current)
 
-        count = len(models)
+        ready_count = sum(1 for m in models if str(m["name"]) in downloaded)
+        unfinished = [n for n in partial_on_disk if n not in downloaded]
         self._ai_test_result.setStyleSheet("color: #3fb950;")
         self._ai_test_result.setText(
             f"Connected to {client.base_url}"
-            + (f"  ·  {count} models" if count else "")
+            + (f"  ·  {len(models)} models" if models else "")
+            + (f"  ·  {ready_count} ready" if ready_count else "")
+            + (f"  ·  {len(unfinished)} unfinished" if unfinished else "")
             + (f"  ·  {current}" if current else "")
             + "."
         )
         self._ai_test_result.setToolTip(
             f"Model running on the agent: {current}" if current else ""
         )
+
+    def _add_model_item(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        size: str = "",
+        vram: str = "",
+        ready: bool = False,
+        partial: bool = False,
+        note: str = "",
+    ) -> None:
+        """One dropdown row: the name, with everything else on hover.
+
+        The flag has to sit in the row — a combo cannot show a tooltip
+        while it is closed — and at the *end* of the name, so the row
+        still reads as a model id. ``✔`` is downloaded and ready to use
+        offline; ``⬇`` is a download that was started and not finished,
+        which the Download button resumes from the bytes already on disk.
+        """
+        mark = (
+            _MODEL_READY_MARK if ready
+            else (_MODEL_PARTIAL_MARK if partial else "")
+        )
+        self._ai_model.addItem(name + mark, name)
+        details = [
+            description.strip(),
+            f"Size: {size}" if size else "",
+            f"VRAM: {vram}" if vram else "",
+            note,
+        ]
+        if ready:
+            details.append("✔ Downloaded — ready to use offline.")
+        elif partial:
+            details.append(
+                "⬇ Download started but not finished — press Download to "
+                "resume it; the bytes already fetched are kept."
+            )
+        else:
+            details.append(
+                "Not downloaded yet — fetched on first use, or now with "
+                "Download."
+            )
+        tip = "\n".join(part for part in details if part)
+        self._ai_model.setItemData(
+            self._ai_model.count() - 1, tip, Qt.ItemDataRole.ToolTipRole,
+        )
+
+    def _list_models_on_disk(self) -> None:
+        """List what the models folder holds when the agent is silent.
+
+        The agent's catalogue is what describes the models, but its
+        absence must not leave the dropdown empty: a user whose agent is
+        stopped still has models on disk, and the ✔ marks are exactly
+        what this page exists to show.
+        """
+        chosen = self._ai_model.currentData() or ""
+        self._ai_model.clear()
+        for name in sorted(self._ai_ready_models | self._ai_partial_models):
+            self._add_model_item(
+                name,
+                ready=name in self._ai_ready_models,
+                partial=name in self._ai_partial_models,
+            )
+        self._ai_model.setPlaceholderText(
+            "No models yet — start the agent to list them"
+        )
+        self._set_agent_model(chosen)
 
     def _update_hardware_row(self) -> None:
         """Say what will generate the answers — and flag a Device that can't.
@@ -1921,12 +2456,33 @@ class SettingsDialog(QDialog):
         if isinstance(llm.get("enable_thinking"), bool):
             self._ai_think.setChecked(llm["enable_thinking"])
 
+    def _show_model_tooltip(self, index: int) -> None:
+        """Put the selected model's details on the closed combo too.
+
+        The dropdown rows are names only; their tooltips hold the
+        description, size and memory use. Qt shows an item tooltip while
+        the popup is open, but the closed combo keeps its own, so the
+        current item's text is copied over whenever the choice changes.
+        """
+        tip = ""
+        if 0 <= index < self._ai_model.count():
+            tip = str(
+                self._ai_model.itemData(index, Qt.ItemDataRole.ToolTipRole)
+                or ""
+            )
+        self._ai_model.setToolTip(tip or self._ai_model_hint)
+
     def _set_agent_model(self, name: str) -> None:
         """Select ``name``, adding it if the agent's list omits it."""
         name = (name or "").strip()
         index = self._ai_model.findData(name)
         if index < 0 and name:
-            self._ai_model.addItem(name, name)
+            self._add_model_item(
+                name,
+                ready=name in self._ai_ready_models,
+                partial=name in self._ai_partial_models,
+                note="Not in the agent's model list — a custom model id.",
+            )
             index = self._ai_model.findData(name)
         self._ai_model.setCurrentIndex(index if index >= 0 else 0)
 
@@ -2051,6 +2607,17 @@ class SettingsDialog(QDialog):
         self._ai_timeout.setValue(max(5, int(s.ai_timeout)))
         self._ai_python.setText(s.ai_python)
         self._set_agent_model(s.ai_model)
+        # The boxes show the folder in force, not an empty box with the
+        # answer in a placeholder: "where do the models go?" is answered
+        # without hovering, and clearing a box puts the default back.
+        self._ai_models_dir.setText(
+            str(agent_service.models_dir(s.ai_models_dir))
+        )
+        self._ai_models_dir.setCursorPosition(0)
+        self._ai_chat_log_dir.setText(
+            str(logs_dir(s.ai_chat_log_dir))
+        )
+        self._ai_chat_log_dir.setCursorPosition(0)
         self._ai_tokens.setValue(max(16, int(s.ai_max_new_tokens)))
         self._ai_device.setCurrentIndex(
             max(0, self._ai_device.findData(s.ai_device_map))
@@ -2189,6 +2756,12 @@ class SettingsDialog(QDialog):
         # just bound, and a saved URL is a stale one by construction.
         s.ai_python = self._ai_python.text().strip()
         s.ai_model = (self._ai_model.currentData() or "").strip()
+        s.ai_models_dir = self._stored_folder(
+            self._ai_models_dir, agent_service.models_dir(""),
+        )
+        s.ai_chat_log_dir = self._stored_folder(
+            self._ai_chat_log_dir, logs_dir(""),
+        )
         s.ai_max_new_tokens = int(self._ai_tokens.value())
         s.ai_device_map = self._ai_device.currentData() or "auto"
         s.ai_quantization = self._ai_quant.currentData() or "none"
@@ -2203,7 +2776,10 @@ class SettingsDialog(QDialog):
         # is down, main.py pushes the same payload when it next starts).
         svc = agent_service.service()
         if s.ai_enabled and svc.state in ("stopped", "failed"):
-            svc.start(python=s.ai_python)
+            # A models-folder change only reaches the agent through its
+            # environment at spawn, so it is passed here too; a restart
+            # is what makes it take effect.
+            svc.start(python=s.ai_python, models_dir=s.ai_models_dir)
         elif not s.ai_enabled and svc.owned:
             svc.stop()
         if svc.state == "running":

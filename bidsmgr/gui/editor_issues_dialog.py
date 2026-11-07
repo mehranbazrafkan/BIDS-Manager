@@ -213,7 +213,12 @@ class EditorIssuesDialog(QDialog):
         bl = QVBoxLayout(body)
         bl.setContentsMargins(12, 10, 12, 10)
         bl.setSpacing(6)
-        self._list = FindingsList("Find a file, a rule, a field or a word")
+        self._list = FindingsList(
+            "Find a file, a rule, a field or a word",
+            # The dataset these files belong to: the AI window walks it
+            # for the dataset's shape and reads the file in question.
+            root=self._bids_root,
+        )
         self._list.activated.connect(self._on_card_activated)
         self._list.fix_requested.connect(self._on_fix_requested)
         if not matched:

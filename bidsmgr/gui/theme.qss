@@ -1545,17 +1545,31 @@ QLabel#ai-fact {
     font-size: 10px;
     color: $text;
 }
-QTextEdit#ai-answer {
+/* The transcript is a scroll area of bubble widgets, not a text edit:
+ * the record behind an answer opens from a real button, and rich text
+ * only knows how to draw a link. So the frame moves to the scroll area
+ * and the turns are painted by the labels inside it. */
+QScrollArea#ai-answer {
     background: $surface2;
-    color: $text;
     border: 1px solid $subtle;
     border-radius: 4px;
-    padding: 8px;
-    font-size: 11px;
-    selection-background-color: $accent;
-    selection-color: $primary_btn_text;
 }
-QTextEdit#ai-answer:focus { border-color: $accent_border; }
+QScrollArea#ai-answer, QWidget#ai-transcript-body { background: $surface2; }
+QWidget#ai-transcript-body QLabel { font-size: 11px; }
+QLabel#ai-answer-empty { color: $muted; font-size: 11px; }
+QPushButton#ai-log {
+    background: transparent;
+    color: $accent;
+    border: 1px solid $border;
+    border-radius: 3px;
+    padding: 2px 9px;
+    font-size: 10px;
+}
+QPushButton#ai-log:hover {
+    background: $accent_bg;
+    color: $accent;
+    border-color: $accent_border;
+}
 QLabel#ai-meta {
     font-size: 10px;
     color: $muted;
@@ -1568,6 +1582,31 @@ QLabel#ai-error {
     border-radius: 4px;
     padding: 8px 10px;
 }
+
+/* The AI agent's progress line: what it is doing, why that takes a
+ * moment, and the seconds once it is writing. The action line carries
+ * the weight; the sentence under it explains, quietly. The glyph column
+ * holds either the spinner or a character, coloured by the "tone"
+ * property the widget sets. */
+QWidget#ai-status, QWidget#ai-status-glyph-box { background: transparent; }
+QLabel#ai-status-title {
+    color: $text;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#ai-status-title[tone="error"] { color: $error; }
+QLabel#ai-status-detail {
+    color: $muted;
+    font-size: 11px;
+}
+QLabel#ai-status-glyph {
+    color: $accent;
+    font-size: 14px;
+    font-weight: 600;
+}
+QLabel#ai-status-glyph[tone="info"] { color: $dim; }
+QLabel#ai-status-glyph[tone="success"] { color: $success; }
+QLabel#ai-status-glyph[tone="error"] { color: $error; }
 
 /* ---------- Scrollbars ---------- */
 QScrollBar:vertical {

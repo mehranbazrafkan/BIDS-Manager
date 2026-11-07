@@ -593,6 +593,9 @@ class ValidationPane(QWidget):
                     field=issue.field,
                     schema_rule=issue.schema_rule,
                     context=dict(context or {}),
+                    # The dataset itself, so the AI window can show the
+                    # agent the shape of it and read this file.
+                    root=self._current_root,
                     view_label=("Show in the header"
                                 if is_image and issue.rule_id in HEADER_RULES else None),
                 )
@@ -740,6 +743,7 @@ class ValidationPane(QWidget):
             field=grp.field,
             schema_rule=grp.schema_rule,
             context=self._group_context(grp),
+            root=self._current_root,
         )
         cl.addWidget(msg)
 

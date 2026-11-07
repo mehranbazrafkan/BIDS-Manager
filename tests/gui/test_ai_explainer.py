@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Iterator, NamedTuple
 
@@ -64,26 +65,43 @@ def _message(qtbot, severity: str, **kwargs) -> ValMessage:
     return msg
 
 
+def _dataset(root):
+    """A tiny dataset: root metadata, a table, one file with a finding."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "dataset_description.json").write_text(
+        '{"Name": "Probe", "BIDSVersion": "1.9.0"}', encoding="utf-8")
+    (root / "participants.tsv").write_text(
+        "participant_id\tage\nsub-01\t24\n", encoding="utf-8")
+    func = root / "sub-01/func"
+    func.mkdir(parents=True, exist_ok=True)
+    (func / "sub-01_task-rest_bold.json").write_text(
+        '{"RepetitionTime": 2.0, "TaskName": "rest"}', encoding="utf-8")
+    return root
+
+
 class _StubAgent(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:               # noqa: D102
         pass
 
     def do_GET(self) -> None:                           # noqa: N802
         if self.path == "/models":
-            body = json.dumps({"models": [
-                {
-                    "name": "stub-7b-instruct",
-                    "description": "A stub for the wire",
-                    "size": "7B",
-                    "vram_gb": "~14 GB (fp16)",
-                },
-                {
-                    "name": "other-model",
-                    "description": "Also a stub",
-                    "size": "1B",
-                    "vram_gb": "~2 GB (fp16)",
-                },
-            ]}).encode()
+            payload = getattr(self.server, "models_payload", None)
+            if payload is None:
+                payload = {"models": [
+                    {
+                        "name": "stub-7b-instruct",
+                        "description": "A stub for the wire",
+                        "size": "7B",
+                        "vram_gb": "~14 GB (fp16)",
+                    },
+                    {
+                        "name": "other-model",
+                        "description": "Also a stub",
+                        "size": "1B",
+                        "vram_gb": "~2 GB (fp16)",
+                    },
+                ]}
+            body = json.dumps(payload).encode()
         elif self.path == "/config":
             body = json.dumps({
                 "llm": {
@@ -105,6 +123,10 @@ class _StubAgent(BaseHTTPRequestHandler):
                     "cpu_cores": 12,
                 },
             }).encode()
+        elif self.path == "/models/download/status":
+            body = json.dumps(
+                self.server.download_status            # type: ignore[attr-defined]
+            ).encode()
         else:
             body = b"{}"
         self.send_response(200)
@@ -126,12 +148,38 @@ class _StubAgent(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"
         received = json.loads(raw or b"{}")
+        if self.path == "/models/download":
+            self.server.download_started = received  # type: ignore[attr-defined]
+            body = json.dumps({
+                "name": received.get("name"), "status": "downloading",
+                "downloaded_bytes": 0, "total_bytes": None, "error": "",
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.server.received = received                 # type: ignore[attr-defined]
         self.server.requests += 1                       # type: ignore[attr-defined]
         body = json.dumps({
             "response": "RepetitionTime is the TR of your scan.",
             "intent": "explain",
             "tool_used": None,
+            "model": "stub/stub-7b-instruct",
+            "prompt_tokens": 214,
+            "generated_tokens": 42,
+            "generation_seconds": 1.25,
+            "model_load_seconds": 4.5,
+            "log": {
+                "system_prompt": "SYSTEM PROMPT",
+                "user_prompt": "What is TR?",
+                "output": "RepetitionTime is the TR of your scan.",
+                "model": "stub/stub-7b-instruct",
+                "prompt_tokens": 214,
+                "generated_tokens": 42,
+                "seconds": 1.25,
+                "model_load_seconds": 4.5,
+            },
         }).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -169,6 +217,11 @@ def stub_agent() -> Iterator[_Stub]:
     server.received = {}                                # type: ignore[attr-defined]
     server.requests = 0                                 # type: ignore[attr-defined]
     server.config = {}                                  # type: ignore[attr-defined]
+    server.download_started = {}                        # type: ignore[attr-defined]
+    server.download_status = {                          # type: ignore[attr-defined]
+        "name": "", "status": "idle", "downloaded_bytes": 0,
+        "total_bytes": None, "error": "",
+    }
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address[:2]
@@ -250,10 +303,10 @@ class TestWhatGetsSent:
     def test_clicking_sends_the_finding_and_the_file(self, qtbot, monkeypatch):
         seen = {}
 
-        def fake_ask(payload, parent=None):
+        def fake_ask(payload, parent=None, root=None):
             seen["payload"] = payload
             seen["parent"] = parent
-            return None
+            seen["root"] = root
 
         monkeypatch.setattr(ai_explainer, "ask", fake_ask)
 
@@ -276,6 +329,82 @@ class TestWhatGetsSent:
         assert payload["path"] == "sub-01/func"
         assert payload["datatype"] == "func"
         assert seen["parent"] is not None
+        # No dataset was handed to this message, so none is claimed.
+        assert seen["root"] is None
+
+    def test_the_dataset_root_travels_to_the_window(
+        self, qtbot, monkeypatch, tmp_path,
+    ):
+        """The window walks the dataset for its shape and reads the
+        file — and it cannot find that dataset itself, because
+        ``context["path"]`` is deliberately relative to the root."""
+        seen = {}
+
+        def fake_ask(payload, parent=None, root=None):
+            seen["root"] = root
+
+        monkeypatch.setattr(ai_explainer, "ask", fake_ask)
+
+        msg = _message(
+            qtbot, "err", context={"path": "sub-01/func"}, root=tmp_path,
+        )
+        qtbot.mouseClick(_ai_buttons(msg)[0], Qt.MouseButton.LeftButton)
+
+        assert seen["root"] == tmp_path
+
+    def test_the_window_sends_the_tree_and_the_file(
+        self, qtbot, stub_agent, tmp_path,
+    ):
+        """The two evidence fields, as they leave the dialog.
+
+        Both are what the agent cannot work out for itself: it never
+        sees the disk. The tree describes the dataset the finding sits
+        in and the digest says what is in the file — and neither
+        carries the folder the dataset was built from, which is the
+        reason ``context["path"]`` is relative in the first place.
+        """
+        _set(ai_base_url=stub_agent.url)
+        root = _dataset(tmp_path / "my_mri_dataset")
+        payload = build_payload(
+            severity="err",
+            message="RepetitionTime is required.",
+            rule_id="evidence.test.tree",
+            extra={"path": "sub-01/func/sub-01_task-rest_bold.json"},
+        )
+
+        dialog = AiExplainDialog(payload, root=root)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received                       # type: ignore[attr-defined]
+        assert sent["dataset_structure"].startswith("my_mri_dataset/")
+        assert "participants.tsv" in sent["dataset_structure"]
+        assert "func/" in sent["dataset_structure"]
+        assert "RepetitionTime: 2.0" in sent["file_content"]
+        assert str(tmp_path) not in sent["dataset_structure"]
+        assert str(tmp_path) not in sent["file_content"]
+
+    def test_no_dataset_means_no_evidence_fields(self, qtbot, stub_agent):
+        """A finding with nothing behind it — no path, no root — must
+        send neither field, not an empty section with a header and
+        nothing under it."""
+        _set(ai_base_url=stub_agent.url)
+        payload = build_payload(
+            severity="warn", message="Something is odd.",
+            rule_id="evidence.test.none",
+        )
+
+        dialog = AiExplainDialog(payload)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received                       # type: ignore[attr-defined]
+        assert "dataset_structure" not in sent
+        assert "file_content" not in sent
 
     def test_ask_is_a_no_op_when_the_feature_is_off(self):
         _set(ai_enabled=False)
@@ -307,14 +436,105 @@ class TestTheDialog:
         qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
 
         assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
-        assert "explain" in dialog._meta.text()
+        # What the answer was made with reads under the message itself
+        # now — the per-message footer — not a summary row for the whole
+        # conversation.
+        assert "intent: explain" in dialog._answer.toPlainText()
+        assert dialog._meta.text() == ""
         assert dialog._error.isHidden()
         # What came back is only half the contract; the finding itself
         # has to have crossed in the shape the agent documents.
         sent = stub_agent.received
-        assert sent["user_input"] == ai_explainer.DEFAULT_PROMPT
+        assert sent["user_input"] == "Explain this error to me."
         assert sent["context"]["rule_id"] == "entity.required"
         assert sent["context"]["path"] == "sub-01/func"
+
+    def test_the_first_question_speaks_of_an_error_or_a_warning(self, qtbot):
+        """The finding's own words, so the question reads as if the user
+        wrote it — and the intent guard routes it without spending a
+        model call on deciding what was asked."""
+        assert ai_explainer.default_prompt({"severity": "err"}) == (
+            "Explain this error to me."
+        )
+        assert ai_explainer.default_prompt({"severity": "warn"}) == (
+            "Explain this warning to me."
+        )
+        assert ai_explainer.default_prompt({"severity": "info"}) == (
+            ai_explainer.DEFAULT_PROMPT
+        )
+        assert ai_explainer.default_prompt({}) == ai_explainer.DEFAULT_PROMPT
+
+        dialog = AiExplainDialog(
+            build_payload(severity="warn", message="x", rule_id="a.b"),
+        )
+        qtbot.addWidget(dialog)
+        assert dialog._default_prompt == "Explain this warning to me."
+
+    def test_the_waiting_line_counts_the_seconds(self, qtbot):
+        """The footer says how long the wait *is*, not just that it is
+        happening — but only once the answer is being written: reading a
+        checkpoint into memory is not the model answering."""
+        dialog = AiExplainDialog(
+            build_payload(severity="err", message="x", rule_id="tick.test"),
+        )
+        qtbot.addWidget(dialog)
+        dialog._set_busy(True)
+        try:
+            assert dialog._status.text() == "Preparing the answer…"
+            # The action line says what; the sentence under it says why,
+            # which is the part a first-time reader actually asks.
+            assert "loads the model" in dialog._status.detail()
+            dialog._on_phase("loading", 0.0)
+            assert dialog._status.text() == "Loading the model…"
+            assert "checkpoint" in dialog._status.detail()
+            assert not dialog._ticker.isActive()
+
+            dialog._on_phase("generating", 0.0)
+            dialog._busy_since = time.time() - 50
+            dialog._tick_status()
+            assert dialog._status.text() == "Writing the answer… (50s)"
+        finally:
+            dialog._set_busy(False)
+        assert dialog._status.text() == ""
+        assert not dialog._ticker.isActive()
+
+    def test_the_status_line_shows_a_live_glyph_and_a_reason(self, qtbot):
+        """A request in flight is a glyph that moves and two lines of
+        words, not one flat "Working". Idle means the line is gone."""
+        dialog = AiExplainDialog(
+            build_payload(severity="err", message="x", rule_id="status.ux"),
+        )
+        qtbot.addWidget(dialog)
+        assert dialog._status.isHidden()
+
+        dialog._set_busy(True)
+        try:
+            assert not dialog._status.isHidden()
+            assert dialog._status._spinner.is_busy()
+            assert dialog._status.text()
+            assert dialog._status.detail()
+        finally:
+            dialog._set_busy(False)
+        assert dialog._status.isHidden()
+
+    def test_the_clock_waits_for_the_model_to_load(self, qtbot):
+        """The first request of a session can spend a minute reading the
+        checkpoint; that minute is not answer time and is not shown as
+        such. Generation reports how long it has been running, so the
+        clock starts where the answer did, not where the poll landed."""
+        dialog = AiExplainDialog(
+            build_payload(severity="err", message="x", rule_id="clock.load"),
+        )
+        qtbot.addWidget(dialog)
+        dialog._set_busy(True)
+        try:
+            dialog._on_phase("loading", 0.0)
+            assert dialog._ticker.isActive() is False
+            dialog._on_phase("generating", 12.0)
+            assert dialog._ticker.isActive()
+            assert 11.0 <= time.time() - dialog._busy_since <= 13.0
+        finally:
+            dialog._set_busy(False)
 
     def test_the_finding_stays_on_screen_alongside_it(
         self, qtbot, stub_agent,
@@ -406,6 +626,356 @@ class TestTheDialog:
 
 
 # =====================================================================
+# The per-message footer
+# =====================================================================
+
+# Each footer and download test asks about its own complaint, so a
+# conversation one of them wrote is never the one another one restores.
+_FOOTER_FINDINGS = 0
+
+
+def _unique_finding(**extra) -> dict:
+    global _FOOTER_FINDINGS
+    _FOOTER_FINDINGS += 1
+    payload = dict(
+        severity="err",
+        message=f"Footer finding {_FOOTER_FINDINGS}.",
+        rule_id=f"footer.unique_{_FOOTER_FINDINGS}",
+        **extra,
+    )
+    return build_payload(**payload)
+
+
+class TestTheAnswerFooter:
+    def _answered_dialog(self, qtbot, stub_agent) -> AiExplainDialog:
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(_unique_finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        return dialog
+
+    def test_the_footer_reports_what_the_answer_was_made_with(
+        self, qtbot, stub_agent,
+    ):
+        """The checkpoint, its time, the tokens it produced, the intent
+        and the button to its record read under the message itself —
+        not in a summary row for the whole conversation. How long the
+        model took to load is not here: it belongs to the record."""
+        dialog = self._answered_dialog(qtbot, stub_agent)
+        plain = dialog._answer.toPlainText()
+        assert "intent: explain" in plain
+        assert "42 tokens" in plain
+        assert "model load" not in plain
+        # The checkpoint leads the line, then the time, then the numbers.
+        footer = dialog._meta_html(dialog._history[1])
+        assert footer.startswith("stub/stub-7b-instruct")
+        # The record opens from a real button under the answer, not from
+        # a word buried in the footer text.
+        assert [b.text() for b in dialog._answer.findChildren(QPushButton)
+                if b.objectName() == "ai-log"] == ["Show full data"]
+        # The summary row only ever says what is true of the
+        # conversation as a whole: with one answer, nothing.
+        assert dialog._meta.text() == ""
+
+    def test_a_second_answer_counts_the_answers(
+        self, qtbot, stub_agent,
+    ):
+        dialog = self._answered_dialog(qtbot, stub_agent)
+        dialog._append("user", "And TRA?")
+        dialog._on_done({
+            "response": "TRA is the time to acquire.", "intent": "explain",
+            "model": "stub/stub-7b-instruct", "generated_tokens": 9,
+            "response_seconds": 0.5,
+            "log": {"system_prompt": "S", "user_prompt": "And TRA?",
+                    "output": "TRA is the time to acquire."},
+        })
+        assert dialog._meta.text() == "2 answers in this conversation"
+        # Each footer carries its own button to its own record.
+        assert len([b for b in dialog._answer.findChildren(QPushButton)
+                    if b.objectName() == "ai-log"]) == 2
+
+    def test_the_button_under_an_answer_opens_its_record(
+        self, qtbot, stub_agent, monkeypatch,
+    ):
+        """A button, not a link: the whole record used to hide behind a
+        word in the footer, and a word is easy not to see."""
+        dialog = self._answered_dialog(qtbot, stub_agent)
+        opened: list[dict] = []
+        monkeypatch.setattr(
+            ai_explainer.AiLogDialog, "exec",
+            lambda self: opened.append(self._snapshot),
+        )
+        buttons = [b for b in dialog._answer.findChildren(QPushButton)
+                   if b.objectName() == "ai-log"]
+        assert len(buttons) == 1
+        buttons[0].click()
+        assert opened and opened[0]["system_prompt"] == "SYSTEM PROMPT"
+        assert opened[0]["output"] == "RepetitionTime is the TR of your scan."
+        assert opened[0]["generated_tokens"] == 42
+        # The record repeats the load time beside the response time.
+        assert opened[0]["model_load_seconds"] == 4.5
+        # Closing the record leaves the conversation where it was: a
+        # window that comes back empty is a window that has to be asked
+        # the same thing twice.
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+    def test_the_full_record_holds_the_load_time(self, qtbot):
+        """The footer leaves the load out; the record keeps it, beside
+        the response time, where it explains a cold first answer."""
+        dialog = ai_explainer.AiLogDialog({
+            "generation_seconds": 2.0,
+            "model_load_seconds": 4.5,
+            "model": "stub/stub-7b-instruct",
+            "system_prompt": "S",
+            "user_prompt": "Q",
+            "output": "A",
+        })
+        qtbot.addWidget(dialog)
+        captions = [
+            w.text() for w in dialog.findChildren(QLabel)
+            if w.objectName() == "val-caption"
+        ]
+        values = [
+            w.text() for w in dialog.findChildren(QLabel)
+            if w.objectName() != "val-caption"
+        ]
+        assert "Response time" in captions
+        assert "Model load" in captions
+        assert "2.0 s" in values
+        assert "4.5 s" in values
+
+    def test_a_turn_without_a_record_opens_nothing(
+        self, qtbot, stub_agent, monkeypatch,
+    ):
+        dialog = self._answered_dialog(qtbot, stub_agent)
+        monkeypatch.setattr(
+            ai_explainer.AiLogDialog, "exec", lambda self: pytest.fail(
+                "something with no record must not open a window",
+            ),
+        )
+        dialog._open_log(99)     # nobody
+        dialog._open_log(0)      # the question, not an answer
+
+
+# =====================================================================
+# The copy that outlives the window
+# =====================================================================
+
+
+class TestTheChatLogOnDisk:
+    """The window's own store restores a conversation while the app runs;
+    these cover the file written beside it, which is what a user can open
+    after the app is closed."""
+
+    def _answered(self, qtbot, stub_agent, payload) -> AiExplainDialog:
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(payload)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        return dialog
+
+    def _lines(self, tmp_path):
+        files = sorted((tmp_path / "chat-logs").glob("*.jsonl"))
+        assert len(files) == 1
+        return [
+            json.loads(line)
+            for line in files[0].read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_a_conversation_is_written_one_file_per_finding(
+        self, qtbot, stub_agent, tmp_path,
+    ):
+        """The question carries the finding; the answer carries the
+        record — the part that explains what the answer was made of."""
+        self._answered(qtbot, stub_agent, _unique_finding())
+
+        lines = self._lines(tmp_path)
+
+        assert [line["role"] for line in lines] == ["user", "assistant"]
+        assert lines[0]["text"] == "Explain this error to me."
+        assert lines[0]["finding"]["severity"] == "err"
+        assert lines[1]["text"] == "RepetitionTime is the TR of your scan."
+        assert lines[1]["meta"]["model"] == "stub/stub-7b-instruct"
+        assert lines[1]["meta"]["log"]["system_prompt"] == "SYSTEM PROMPT"
+
+    def test_reopening_a_finding_does_not_write_it_again(
+        self, qtbot, stub_agent, tmp_path,
+    ):
+        """Restoring is a read. A second copy of the same transcript
+        would make the file claim the question was asked twice."""
+        payload = _unique_finding()
+        self._answered(qtbot, stub_agent, payload)
+
+        restored = AiExplainDialog(payload)
+        qtbot.addWidget(restored)
+
+        assert restored.restored()
+        assert len(self._lines(tmp_path)) == 2
+
+
+# =====================================================================
+# The download that runs before the question
+# =====================================================================
+
+
+class TestTheDownloadBeforeTheQuestion:
+    def test_a_model_that_is_not_local_is_fetched_first(
+        self, qtbot, stub_agent,
+    ):
+        """The configured model is not downloaded: it is fetched
+        visibly, with a progress bar, and no question is sent while
+        gigabytes are arriving — so no request timer can fire."""
+        server = stub_agent.server
+        server.models_payload = {"models": [{
+            "name": "stub-7b-instruct", "description": "A stub",
+            "size": "7B", "vram_gb": "", "downloaded": False,
+        }]}
+        server.download_status = {
+            "name": "stub-7b-instruct", "status": "downloading",
+            "downloaded_bytes": 400_000_000, "total_bytes": 3_400_000_000,
+            "error": "",
+        }
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(_unique_finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+
+        # The bar appears while the download runs, before any question.
+        qtbot.waitUntil(lambda: dialog._download_bar.isVisible(),
+                        timeout=5_000)
+        assert stub_agent.requests == 0
+        # The first poll lands a moment after the bar does: the note
+        # goes from "looking up the size" to bytes out of bytes.
+        qtbot.waitUntil(
+            lambda: "of" in dialog._download_note.text()
+            and "%" in dialog._download_note.text(),
+            timeout=5_000,
+        )
+
+        # The fetch finishes: the question goes out, the bar goes away.
+        server.download_status = {
+            **server.download_status, "status": "done",
+        }
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert stub_agent.requests == 1
+        assert not dialog._download_bar.isVisible()
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+    def test_a_failed_download_is_reported_not_swallowed(
+        self, qtbot, stub_agent,
+    ):
+        server = stub_agent.server
+        server.models_payload = {"models": [{
+            "name": "stub-7b-instruct", "description": "A stub",
+            "size": "7B", "vram_gb": "", "downloaded": False,
+        }]}
+        server.download_status = {
+            "name": "stub-7b-instruct", "status": "error",
+            "downloaded_bytes": 0, "total_bytes": None,
+            "error": "network gone",
+        }
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(_unique_finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert stub_agent.requests == 0
+        assert not dialog._error.isHidden()
+        assert "network gone" in dialog._error.text()
+        # The window is not left in a dead state: they can try again.
+        assert dialog._retry_btn.isEnabled()
+
+    def test_a_restarted_agent_ends_the_wait_instead_of_spinning(
+        self, qtbot, stub_agent,
+    ):
+        """The download job lives in the agent's process. If it restarts,
+        the status goes back to idle; the dialog must say so instead of
+        polling a bar that can never move again."""
+        server = stub_agent.server
+        server.models_payload = {"models": [{
+            "name": "stub-7b-instruct", "description": "A stub",
+            "size": "7B", "vram_gb": "", "downloaded": False,
+        }]}
+        # The stub's default status is exactly what a new process reports:
+        # no job, no name.
+        server.download_status = {
+            "name": "", "status": "idle", "downloaded_bytes": 0,
+            "total_bytes": None, "error": "",
+        }
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(_unique_finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert stub_agent.requests == 0
+        assert not dialog._error.isHidden()
+        assert "restarted" in dialog._error.text()
+        assert not dialog._download_bar.isVisible()
+        assert dialog._retry_btn.isEnabled()
+
+    def test_a_model_outside_the_list_is_fetched_by_a_modern_agent(
+        self, qtbot, stub_agent,
+    ):
+        """A repo the agent's shortlist does not mention (a custom model
+        id) is still fetched first: a modern agent flags everything it
+        has, so its silence about this one means it is not local."""
+        server = stub_agent.server
+        server.models_payload = {"models": [{
+            "name": "other-model", "description": "Also a stub",
+            "size": "1B", "vram_gb": "", "downloaded": True,
+        }]}
+        server.download_status = {
+            "name": "stub-7b-instruct", "status": "done",
+            "downloaded_bytes": 1, "total_bytes": 1, "error": "",
+        }
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(_unique_finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert server.download_started["name"] == "stub-7b-instruct"
+        assert stub_agent.requests == 1
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+    def test_a_local_model_skips_the_download(
+        self, qtbot, stub_agent,
+    ):
+        """The agent's list says the model is already there: the
+        question goes out as an ordinary one, no bar, no fetch."""
+        server = stub_agent.server
+        server.models_payload = {"models": [{
+            "name": "stub-7b-instruct", "description": "A stub",
+            "size": "7B", "vram_gb": "", "downloaded": True,
+        }]}
+
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(_unique_finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert stub_agent.requests == 1
+        assert not dialog._download_bar.isVisible()
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+
+# =====================================================================
 # The conversation
 # =====================================================================
 
@@ -456,7 +1026,7 @@ class TestTheConversation:
         qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
 
         shown = dialog._answer.toPlainText()
-        assert ai_explainer.DEFAULT_PROMPT in shown
+        assert "Explain this error to me." in shown
         assert "What is TR?" in shown
         # Both answers, not just the one that arrived last.
         assert shown.count("RepetitionTime is the TR") == 2
@@ -492,11 +1062,106 @@ class TestTheConversation:
         assert isinstance(history, list) and history
         assert history[0] == {
             "role": "user",
-            "content": ai_explainer.DEFAULT_PROMPT,
+            "content": "Explain this error to me.",
         }
         assert history[1]["role"] == "assistant"
         # The new question stays its own field rather than joining them.
         assert stub_agent.received["user_input"] == "What is TR?"
+
+    def test_ask_again_re_asks_without_asking_the_question_twice(
+        self, qtbot, stub_agent,
+    ):
+        """The button's whole job is to try again, not to ask again.
+
+        It used to re-send the question on top of a history that already
+        held that same question and its answer, so the model was handed
+        the identical words twice with an answer already attached — and
+        answered as if starting over: "give me the error", with the
+        error in the context the whole time.
+        """
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._retry_btn.click()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received
+        assert sent["user_input"] == "Explain this error to me."
+        # Nothing came before this question, so nothing travels: the
+        # request is indistinguishable from the first one.
+        assert "history" not in sent
+        # ...and the screen still holds one question and one answer.
+        assert [t["role"] for t in dialog._history] == ["user", "assistant"]
+
+    def test_ask_again_replaces_the_answer_it_is_re_asking_about(
+        self, qtbot, stub_agent,
+    ):
+        """A re-ask regenerates an answer; it does not stack a second.
+
+        Both the question and the answer being replaced are held back
+        from the request: what travels is the conversation that came
+        before them, so the model answers the question again instead of
+        reading an answer it has already given as the reply it owes.
+        """
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._followup.setText("What is TR?")
+        send = next(
+            b for b in dialog.findChildren(QPushButton)
+            if b.objectName() == "val-ai"
+        )
+        qtbot.mouseClick(send, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._retry_btn.click()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received
+        assert sent["user_input"] == "What is TR?"
+        assert sent["history"] == [
+            {"role": "user", "content": "Explain this error to me."},
+            {"role": "assistant",
+             "content": "RepetitionTime is the TR of your scan."},
+        ]
+        # One copy of each turn on screen: the new answer took the old
+        # one's place rather than landing under it.
+        assert [t["role"] for t in dialog._history] == [
+            "user", "assistant", "user", "assistant",
+        ]
+
+    def test_a_failed_ask_again_keeps_the_answer_it_was_replacing(
+        self, qtbot, stub_agent, dead_url,
+    ):
+        """Trying again must not cost the answer already on screen.
+
+        Nothing about the transcript changes until the new answer
+        arrives, so a retry into a dead agent leaves the conversation
+        exactly where it was — one click from trying once more.
+        """
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+        _set(ai_base_url=dead_url, ai_timeout=5)
+        dialog._retry_btn.click()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        assert not dialog._error.isHidden()
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+        assert [t["role"] for t in dialog._history] == ["user", "assistant"]
 
     def test_reopening_a_finding_restores_it_and_generates_nothing(
         self, qtbot, stub_agent,
@@ -520,7 +1185,7 @@ class TestTheConversation:
 
         assert second.restored()
         assert not second.is_busy()
-        assert ai_explainer.DEFAULT_PROMPT in second._answer.toPlainText()
+        assert "Explain this error to me." in second._answer.toPlainText()
         assert "RepetitionTime is the TR" in second._answer.toPlainText()
         assert "restored" in second._status.text().lower()
         # The one request above is still the only one.
@@ -562,7 +1227,7 @@ class TestTheConversation:
         assert second._answer.toPlainText().strip() == ""
         # ...and the user's typing is not what got lost: it is back in
         # the box, one Enter from a retry.
-        assert first._followup.text() == ai_explainer.DEFAULT_PROMPT
+        assert first._followup.text() == "Explain this error to me."
 
 
 # =====================================================================
@@ -668,6 +1333,56 @@ class TestSettings:
         assert after.ai_enable_thinking is True
         assert after.ai_temperature == pytest.approx(1.25)
 
+    def test_both_folders_are_shown_and_saved(self, qtbot, tmp_path):
+        """Where models land and where conversations are written — the
+        two paths a download and a chat log actually use — are on the
+        page, editable, and saved."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        models = tmp_path / "models-here"
+        logs = tmp_path / "logs-here"
+        s = AppSettings()
+        s.ai_enabled = False
+        s.ai_models_dir = str(models)
+        s.ai_chat_log_dir = str(logs)
+        dialog = SettingsDialog(s)
+        qtbot.addWidget(dialog)
+
+        assert dialog._ai_models_dir.text() == str(models)
+        assert dialog._ai_chat_log_dir.text() == str(logs)
+
+        changed = tmp_path / "logs-elsewhere"
+        dialog._ai_chat_log_dir.setText(str(changed))
+        dialog._on_save()
+
+        after = AppSettings.load()
+        assert after.ai_models_dir == str(models)
+        assert after.ai_chat_log_dir == str(changed)
+
+    def test_the_folder_boxes_show_the_path_in_force(self, qtbot):
+        """An unset folder means the per-user default. The boxes name
+        that folder rather than hiding it in a placeholder, and saving
+        an untouched box stores "" so it keeps following the machine."""
+        from bidsmgr import agent_service
+        from bidsmgr.ai_chat_log import logs_dir
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        s = AppSettings()
+        s.ai_enabled = False
+        dialog = SettingsDialog(s)
+        qtbot.addWidget(dialog)
+
+        assert dialog._ai_models_dir.text() == str(
+            agent_service.models_dir("")
+        )
+        assert dialog._ai_chat_log_dir.text() == str(logs_dir(""))
+
+        dialog._on_save()
+
+        after = AppSettings.load()
+        assert after.ai_models_dir == ""
+        assert after.ai_chat_log_dir == ""
+
     def test_the_model_dropdown_offers_only_what_the_loader_accepts(
         self, qtbot,
     ):
@@ -690,10 +1405,9 @@ class TestSettings:
 
         dialog = SettingsDialog(AppSettings())
         qtbot.addWidget(dialog)
-        titles = [
-            dialog._tabs.tabText(i) for i in range(dialog._tabs.count())
-        ]
-        assert "AI Agent" in titles
+        # The pages hang off the nav list (one row per page, a stack to
+        # the right), not a QTabWidget.
+        assert "AI Agent" in dialog._page_titles
 
     def test_connection_reports_the_running_model(self, qtbot, stub_agent):
         from bidsmgr.gui.settings_dialog import SettingsDialog
@@ -723,6 +1437,66 @@ class TestSettings:
         dialog._test_agent_connection()
 
         assert "Could not reach" in dialog._ai_test_result.text()
+
+    def test_a_download_that_lost_its_job_stops_asking(
+        self, qtbot, stub_agent, fake_agent_service,
+    ):
+        """The status lives in the agent's process: after a restart the
+        slot is idle, and polling it would show a bar at zero forever."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        fake_agent_service.pretend_running(stub_agent.url)
+        _set(ai_base_url=stub_agent.url)
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+        dialog._refresh_agent_models()
+        dialog._ai_model.setCurrentIndex(
+            dialog._ai_model.findData("stub-7b-instruct")
+        )
+        stub_agent.server.download_status = {
+            "name": "", "status": "idle", "downloaded_bytes": 0,
+            "total_bytes": None, "error": "",
+        }
+
+        dialog._download_selected_model()
+        assert not dialog._ai_download_btn.isEnabled()
+
+        dialog._poll_model_download()                 # one poll, by hand
+
+        assert "restarted" in dialog._ai_download_info.text()
+        assert dialog._ai_download_btn.isEnabled()
+        assert not dialog._ai_download_bar.isVisible()
+        assert not dialog._ai_download_timer.isActive()
+
+    def test_an_install_from_the_dialog_fills_the_list_once_the_agent_is_up(
+        self, qtbot, stub_agent, dead_url, fake_agent_service,
+    ):
+        """The install starts the agent, which then needs seconds to
+        answer. The first list request fails; the status poll has to try
+        again when the service says it is serving, or the page keeps an
+        empty dropdown."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        _set(ai_base_url=dead_url)
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._on_agent_installed("C:/agent/.venv/python.exe")
+
+        assert fake_agent_service.started_with[-1] == (
+            "C:/agent/.venv/python.exe"
+        )
+        assert dialog._ai_waiting_for_agent
+        assert not dialog._ai_models_fetched
+
+        # Now the agent is serving, and the poll reaches it.
+        _set(ai_base_url=stub_agent.url)
+        fake_agent_service.pretend_running(stub_agent.url)
+        dialog._update_agent_status()
+
+        assert dialog._ai_models_fetched
+        assert dialog._ai_model.currentData() == "stub-7b-instruct"
+        assert not dialog._ai_waiting_for_agent
 
     # -- what the answers will be made on ---------------------------
 
@@ -942,6 +1716,85 @@ class TestStartingTheAgent:
         # The agent's own current model is what ends up selected, not
         # the placeholder: the user is being shown what is running.
         assert dialog._ai_model.currentData() == "stub-7b-instruct"
+
+    def test_the_dropdown_flags_what_is_downloaded_and_has_no_placeholder(
+        self, qtbot, stub_agent, fake_agent_service, tmp_path, monkeypatch,
+    ):
+        """The rows are the names plus a ✓ flag; there is no "as
+        configured on the agent" row that can be picked by mistake."""
+        from bidsmgr.gui import ai_models
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        stub_agent.server.models_payload = {          # type: ignore[attr-defined]
+            "models": [
+                {
+                    "name": "ready-model",
+                    "description": "Already here",
+                    "downloaded": True,
+                },
+                {
+                    "name": "remote-model",
+                    "description": "Not here",
+                    "downloaded": False,
+                },
+            ],
+        }
+        fake_agent_service.pretend_running(stub_agent.url)
+        _set(ai_base_url=stub_agent.url)
+        empty = tmp_path / "models"
+        empty.mkdir()
+        monkeypatch.setattr(
+            ai_models, "models_dir", lambda override="": empty,
+        )
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._refresh_agent_models()
+
+        texts = [
+            dialog._ai_model.itemText(i)
+            for i in range(dialog._ai_model.count())
+        ]
+        assert any(
+            text.startswith("ready-model") and text.endswith("✔")
+            for text in texts
+        ), texts
+        assert any(text.startswith("remote-model") for text in texts), texts
+        assert not any("as configured" in text for text in texts)
+
+    def test_a_stopped_agent_still_lists_what_is_on_disk(
+        self, qtbot, dead_url, tmp_path, monkeypatch,
+    ):
+        """The ✔ marks do not need a running agent: what is on disk is
+        what the next start will find, and the page exists to show it."""
+        from bidsmgr.gui import ai_models
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        root = tmp_path / "models"
+        repo = root / "models--Qwen--Qwen3-1.7B"
+        (repo / "refs").mkdir(parents=True)
+        (repo / "refs" / "main").write_text("abc123", encoding="utf-8")
+        snapshot = repo / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_bytes(b"x")
+        monkeypatch.setattr(
+            ai_models, "models_dir", lambda override="": root,
+        )
+        _set(ai_base_url=dead_url)
+
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._refresh_agent_models()
+
+        texts = [
+            dialog._ai_model.itemText(i)
+            for i in range(dialog._ai_model.count())
+        ]
+        assert any(
+            text.startswith("Qwen/Qwen3-1.7B") and text.endswith("✔")
+            for text in texts
+        ), texts
 
     def test_the_knobs_are_corrected_to_what_the_agent_runs(
         self, qtbot, stub_agent, fake_agent_service,

@@ -16,11 +16,13 @@ makes the race safe in the first place.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Iterator
 
 import pytest
@@ -379,7 +381,7 @@ class TestReuse:
 
         chosen: list[int] = []
 
-        def fake_spawn(self, exe, requested, log_path, generation):
+        def fake_spawn(self, exe, requested, log_path, generation, *_):
             chosen.append(requested)
             raise agent_service._Failure("stopped before launching")
 
@@ -405,7 +407,7 @@ class TestReuse:
 
         chosen: list[int] = []
 
-        def fake_spawn(self, exe, requested, log_path, generation):
+        def fake_spawn(self, exe, requested, log_path, generation, *_):
             chosen.append(requested)
             raise agent_service._Failure("stopped before launching")
 
@@ -432,4 +434,76 @@ class TestReuse:
 
         assert _until(lambda: svc.state != "starting")
         assert svc.state == "failed"
-        assert "not found" in svc.detail
+        # The message points at the installer, which is what can fix it:
+        # "reinstall BIDS-Manager" was never something a user could act on.
+        assert "not installed" in svc.detail
+        assert "Install" in svc.detail
+
+
+# =====================================================================
+# Where the models live
+# =====================================================================
+
+
+class TestWhereModelsLive:
+    def test_the_default_sits_in_the_per_user_application_folder(
+        self, monkeypatch, tmp_path,
+    ):
+        """Multi-GB, per-user data: not inside the install directory and
+        not in the hidden Hugging Face default under the home folder."""
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+        got = agent_service.default_models_dir()
+
+        assert got.name == "models"
+        assert "bidsmgr" in got.parts
+        if os.name == "nt":
+            # Qt's AppLocalDataLocation puts the organisation in the path
+            # on Windows only; models must land exactly where it says.
+            assert got == tmp_path / "bidsmgr" / "bidsmgr" / "models"
+
+    def test_a_stored_folder_wins_and_blank_means_the_default(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+        assert agent_service.models_dir("") == (
+            agent_service.default_models_dir()
+        )
+        assert agent_service.models_dir("   ") == (
+            agent_service.default_models_dir()
+        )
+        assert agent_service.models_dir(f"  {tmp_path / 'mine'}  ") == (
+            tmp_path / "mine"
+        )
+
+    def test_a_tilde_in_a_stored_folder_means_the_home_folder(self):
+        assert agent_service.models_dir("~/models") == Path.home() / "models"
+
+    def test_the_agent_is_spawned_with_the_folder_in_its_environment(
+        self, monkeypatch, tmp_path,
+    ):
+        """huggingface_hub reads the cache at import time, so the folder
+        has to travel as an environment variable, before the import."""
+        captured: dict = {}
+
+        class FakeProc:
+            def poll(self):                             # pragma: no cover
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return FakeProc()
+
+        monkeypatch.setattr(agent_service.subprocess, "Popen", fake_popen)
+
+        target = tmp_path / "models"
+        svc = agent_service.AgentService()
+        svc._spawn(["python"], 8765, tmp_path / "agent.log", 0, str(target))
+
+        env = captured["env"]
+        assert env[agent_service.HUB_CACHE_ENV] == str(target)
+        assert env[agent_service.MODELS_DIR_ENV] == str(target)
+        assert env["BIDS_AGENT_PORT"] == "8765"
+        assert captured["cmd"][-1] == "main.py"

@@ -80,6 +80,31 @@ def build_footer_with(
     return footer
 
 
+def build_footer_stacked(
+    top: Optional[QWidget], buttons: QDialogButtonBox,
+) -> QFrame:
+    """A footer with a status block above the buttons.
+
+    A two-line progress report beside three buttons has no room to
+    wrap: at the dialog's minimum width it would break every two words.
+    Above them it gets the whole footer width, and the buttons keep
+    their usual bottom-right corner.
+    """
+    footer = QFrame()
+    footer.setObjectName("issue-dialog-footer")
+    outer = QVBoxLayout(footer)
+    outer.setContentsMargins(14, 10, 14, 10)
+    outer.setSpacing(8)
+    if top is not None:
+        outer.addWidget(top)
+    row = QHBoxLayout()
+    row.setSpacing(8)
+    row.addStretch(1)
+    row.addWidget(buttons)
+    outer.addLayout(row)
+    return footer
+
+
 def scrollable_body() -> tuple[QScrollArea, QVBoxLayout]:
     """A body that scrolls, painted like the dialog rather than like a list.
 
@@ -208,6 +233,7 @@ __all__ = [
     "WrapLabel",
     "stat",
     "build_footer",
+    "build_footer_stacked",
     "build_footer_with",
     "build_header",
     "card",

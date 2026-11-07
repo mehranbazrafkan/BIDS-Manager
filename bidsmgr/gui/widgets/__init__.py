@@ -9,10 +9,12 @@ Public surface — every widget the Converter and Editor views compose:
   and the paint helper the table delegates re-use.
 * :class:`SidecarRow`     — one row of the Editor's sidecar form.
 * :class:`ValMessage`     — one validator finding rendered as a row.
+* :class:`AgentStatus`    — the AI window's footer progress line.
 
 Lift-and-shift from ``inspector_proto/proto.py``; no logic change.
 """
 
+from .agent_status import AgentStatus
 from .bids_tree_pane import BidsTreePane
 from .json_tree_view import JsonTreeView
 from .panel_frame import PanelFrame
@@ -39,6 +41,7 @@ from .status_badge import (
 from .val_message import ValMessage
 
 __all__ = [
+    "AgentStatus",
     "BidsTreePane",
     "BusySpinner",
     "Chip",

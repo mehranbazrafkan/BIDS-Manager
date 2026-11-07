@@ -130,16 +130,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     app.aboutToQuit.connect(agent.stop)
     atexit.register(agent.stop)
     if persisted.ai_enabled:
+        from . import agent_installer as _agent_installer
         from .gui.ai_explainer import push_llm_config
 
-        # Pushed only once the agent is up: our stored LLM preferences
-        # are what it should run with, not whatever its config.json says.
-        agent.start(
-            python=persisted.ai_python,
-            on_ready=lambda: _quietly(
-                lambda: push_llm_config(persisted)
-            ),
-        )
+        # Only when the module is there: starting a missing agent fails
+        # with a message Settings can explain, and the AI Agent page
+        # offers to install it on a first run. Models live in the stored
+        # folder (or the per-user default) — passed so the agent's
+        # environment points the Hugging Face cache there at spawn.
+        if _agent_installer.installed():
+            agent.start(
+                python=persisted.ai_python,
+                models_dir=persisted.ai_models_dir,
+                on_ready=lambda: _quietly(
+                    lambda: push_llm_config(persisted)
+                ),
+            )
 
     from .gui.main_window import MainWindow
 

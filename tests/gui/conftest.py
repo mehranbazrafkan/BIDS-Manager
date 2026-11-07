@@ -44,6 +44,13 @@ def isolated_settings(tmp_path: Path) -> Iterator[None]:
     QCoreApplication.setApplicationName("bidsmgr-tests")
     # Ensure an empty starting state.
     QSettings().clear()
+    # The AI window writes every turn to a chat-log folder
+    # (``bidsmgr.ai_chat_log``); point it at this test's tmp_path so a
+    # stub-agent conversation never leaves logs in the developer's real
+    # application data folder. Same key as
+    # ``app_settings.KEYS["ai_chat_log_dir"]`` — spelled out because
+    # importing the gui package here would pull in the whole GUI.
+    QSettings().setValue("ai/chat_log_dir", str(tmp_path / "chat-logs"))
     QSettings().sync()
     try:
         yield
@@ -77,11 +84,15 @@ class FakeAgentService:
         self.url = ""
         self.owned = False
         self.started_with: list[str] = []
+        self.models_dirs: list[str] = []
         self.stop_calls = 0
 
     # -- the surface AgentService has --------------------------------
-    def start(self, *, python: str = "", on_ready=None) -> None:
+    def start(
+        self, *, python: str = "", models_dir: str = "", on_ready=None,
+    ) -> None:
         self.started_with.append(python)
+        self.models_dirs.append(models_dir)
         self.state = "starting"
         self.detail = "Starting the AI agent..."
         self.url = ""

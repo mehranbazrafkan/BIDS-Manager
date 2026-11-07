@@ -14,7 +14,7 @@ output with no reshaping.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -129,6 +129,7 @@ class ValMessage(QFrame):
         context: Optional[dict] = None,
         parent=None,
         view_label: Optional[str] = None,
+        root: Any = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName(_OBJECT_NAME_BY_SEVERITY.get(severity, "val-msg"))
@@ -145,6 +146,11 @@ class ValMessage(QFrame):
         # signal so the button works wherever a ValMessage is used,
         # including inside dialogs that wire nothing up.
         self._context = dict(context or {})
+        # The dataset that file belongs to, handed to :func:`ask` so the
+        # explanation window can show the agent the dataset's shape and
+        # read the file itself. Hosts that do not have one pass nothing
+        # and the window sends neither.
+        self._root = root
 
         # Vertical, not horizontal. The old layout put the badge in a column
         # beside everything else and the field chip out on the right, which
@@ -354,6 +360,11 @@ class ValMessage(QFrame):
                 extra=self._context,
             ),
             parent=self.window(),
+            # Without this the window cannot find the dataset to
+            # describe or the file to read: ``context["path"]`` is
+            # relative to the root by design, and only the host pane
+            # knows what it is relative to.
+            root=self._root,
         )
 
     def _on_context_menu(self, pos) -> None:

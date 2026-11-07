@@ -123,6 +123,8 @@ KEYS = {
     # already knows where it is.
     "ai_python":        "ai/python",         # "" = auto-detect an interpreter
     "ai_model":         "ai/model",          # "" = whatever the agent runs
+    "ai_models_dir":    "ai/models_dir",     # "" = per-user application data folder
+    "ai_chat_log_dir":  "ai/chat_log_dir",   # "" = application data + /chat-logs
     "ai_max_new_tokens": "ai/max_new_tokens",
     "ai_device_map":    "ai/device_map",     # auto | cpu | cuda | mps
     "ai_quantization":  "ai/quantization",   # none | 4bit | 8bit
@@ -347,6 +349,19 @@ class AppSettings:
     # LLM settings, pushed to the agent over PUT /config once it is up.
     # Empty model = leave whatever the agent's own config.json says.
     ai_model: str = ""
+    # Where downloaded models live. "" means the per-user application
+    # data folder (QStandardPaths.AppLocalDataLocation + /models), which
+    # is where multi-GB, per-user data belongs. The agent is spawned
+    # with HF_HUB_CACHE pointed there, so models copied into the folder
+    # by hand and models downloaded through the GUI land in the same
+    # place. Changing it takes effect the next time the agent starts.
+    ai_models_dir: str = ""
+    # Where the AI window's conversations are written, one JSONL file per
+    # finding (see bidsmgr.ai_chat_log). "" means the per-user application
+    # data folder + /chat-logs, next to the models. Unlike the models, a
+    # change takes effect on the next answer — the folder is read when a
+    # turn is written, not when the agent is spawned.
+    ai_chat_log_dir: str = ""
     ai_max_new_tokens: int = 250
     ai_device_map: str = "auto"        # auto | cpu | cuda | mps
     ai_quantization: str = "none"      # none | 4bit | 8bit
@@ -629,6 +644,12 @@ class AppSettings:
             out.ai_timeout = 120
         out.ai_python = _as_str(s.value(KEYS["ai_python"]), out.ai_python).strip()
         out.ai_model = _as_str(s.value(KEYS["ai_model"]), out.ai_model).strip()
+        out.ai_models_dir = _as_str(
+            s.value(KEYS["ai_models_dir"]), out.ai_models_dir,
+        ).strip()
+        out.ai_chat_log_dir = _as_str(
+            s.value(KEYS["ai_chat_log_dir"]), out.ai_chat_log_dir,
+        ).strip()
         # The model list used to offer google/gemma-3-270m, the *base*
         # checkpoint: no instruction tuning, no chat template, so asking it
         # a question failed outright. The -it sibling is the same size and
@@ -763,6 +784,8 @@ class AppSettings:
         s.setValue(KEYS["ai_timeout"], int(self.ai_timeout))
         s.setValue(KEYS["ai_python"], self.ai_python)
         s.setValue(KEYS["ai_model"], self.ai_model)
+        s.setValue(KEYS["ai_models_dir"], self.ai_models_dir)
+        s.setValue(KEYS["ai_chat_log_dir"], self.ai_chat_log_dir)
         s.setValue(KEYS["ai_device_map"], self.ai_device_map)
         s.setValue(KEYS["ai_quantization"], self.ai_quantization)
         s.setValue(KEYS["ai_max_new_tokens"], int(self.ai_max_new_tokens))
@@ -848,6 +871,18 @@ class AppSettings:
     @classmethod
     def remember_theme(cls, theme: str) -> None:
         cls._settings().setValue(KEYS["theme"], theme)
+
+    @classmethod
+    def remember_ai_python(cls, python: str) -> None:
+        """Persist the interpreter the installer just built.
+
+        Written on its own rather than through :meth:`save`: the install
+        finishes while the Settings dialog is open, and saving the copy
+        the dialog loaded at open time would write back every other
+        field as it was then (the ``active_view`` / sidecar-view
+        remembers must not be reverted by an unrelated save).
+        """
+        cls._settings().setValue(KEYS["ai_python"], str(python).strip())
 
     @classmethod
     def remember_active_view(cls, view: str) -> None:
