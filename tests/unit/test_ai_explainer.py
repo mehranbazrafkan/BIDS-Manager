@@ -25,11 +25,14 @@ from typing import Iterator
 import pytest
 
 from bidsmgr.gui.ai_explainer import (
-    HISTORY_SENT,
+    DIGEST_MAX_LINES,
+    TREE_MAX_LINES,
     AgentClient,
     AgentError,
     build_payload,
     conversation_key,
+    dataset_tree,
+    file_digest,
     hardware_text,
     plain_text,
 )
@@ -210,6 +213,234 @@ class TestPlainText:
 
 
 # =====================================================================
+# Evidence: the dataset and the file behind a finding
+# =====================================================================
+
+
+def _dataset(root) -> dict:
+    """A small dataset shaped like a real one, plus its offending file.
+
+    Returns the paths the tests ask about. Deliberately built with the
+    same layout the desktop app would find — root, subjects, sessions,
+    datatypes — because the tree's whole job is to describe *that*
+    shape rather than any shape a test could invent.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "README").write_text("A dataset.\n", encoding="utf-8")
+    (root / "dataset_description.json").write_text(
+        '{"Name": "Probe", "BIDSVersion": "1.9.0"}', encoding="utf-8")
+    (root / "participants.tsv").write_text(
+        "participant_id\tage\tsex\n"
+        + "".join(f"sub-{i:02d}\t{20 + i}\tF\n" for i in range(1, 9)),
+        encoding="utf-8",
+    )
+    anat = root / "sub-01/ses-01/anat"
+    func = root / "sub-01/ses-01/func"
+    anat.mkdir(parents=True, exist_ok=True)
+    func.mkdir(parents=True, exist_ok=True)
+    (anat / "sub-01_ses-01_T1w.json").write_text(
+        '{"RepetitionTime": 2.0, "EchoTime": 0.003}', encoding="utf-8")
+    # Busy enough that a folder listing has to choose: twelve runs in
+    # one folder is a quiet Tuesday for a real study.
+    for i in range(12):
+        (func / f"sub-01_ses-01_task-rest_run-{i:02d}_bold.json").write_text(
+            "{}", encoding="utf-8")
+    (func / "sub-01_ses-01_task-rest_bold.json").write_text(
+        '{"RepetitionTime": 2.0, "TaskName": "rest"}', encoding="utf-8")
+    sub02 = root / "sub-02/anat"
+    sub02.mkdir(parents=True, exist_ok=True)
+    binary = sub02 / "sub-02_T1w.nii.gz"
+    binary.write_bytes(b"\x1f\x8b" + bytes(2048))
+    return {
+        "root": root,
+        "sidecar": anat / "sub-01_ses-01_T1w.json",
+        "bold": func / "sub-01_ses-01_task-rest_bold.json",
+        "binary": binary,
+    }
+
+
+class TestDatasetTree:
+    def test_the_main_parts_of_a_dataset_are_drawn(self, tmp_path):
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        tree = dataset_tree(paths["root"])
+
+        assert tree.startswith("my_mri_dataset/")
+        for expected in (
+            "README", "dataset_description.json", "participants.tsv",
+            "sub-01/", "sub-02/", "ses-01/", "anat/", "func/",
+            "├── ", "└── ",
+        ):
+            assert expected in tree
+        # …and it explains itself rather than listing bare names.
+        assert "# dataset metadata" in tree
+        assert "# subject" in tree
+
+    def test_the_finding_folder_is_listed_properly(self, tmp_path):
+        """The folder the model is asked about is the one folder worth
+        listing: four files would hide eleven of the twelve runs."""
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        focused = dataset_tree(paths["root"], focus="sub-01/ses-01/func")
+
+        assert "run-11_bold.json" in focused
+        assert "more files" not in focused.split("func/")[1]
+
+    def test_busy_folders_collapse_behind_a_marker(self, tmp_path):
+        """Elsewhere four files stand for the folder: a listing of
+        287,000 files is not a prompt, it is a hostage."""
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        plain = dataset_tree(paths["root"])
+
+        assert "run-04_bold.json" not in plain
+        assert "more files" in plain
+
+    def test_no_absolute_path_leaks_into_the_tree(self, tmp_path):
+        """``context["path"]`` is made relative so the reviewer's home
+        directory never reaches a prompt; the tree must not undo that."""
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        tree = dataset_tree(paths["root"], focus="sub-01/ses-01/func")
+
+        assert str(tmp_path).replace("\\", "/") not in tree
+        assert str(tmp_path) not in tree
+
+    def test_the_line_budget_holds(self, tmp_path):
+        """Depth, not width: 300 folders side by side collapse behind
+        ``… more folders`` long before the budget matters, so this one
+        nests deep enough to draw every line it can."""
+        root = tmp_path / "huge"
+        root.mkdir()
+        for i in range(8):
+            subject = root / f"sub-{i:02d}"
+            subject.mkdir()
+            for j in range(8):
+                session = subject / f"ses-{j:02d}"
+                session.mkdir()
+                for k in range(8):
+                    (session / f"anat-{k}").mkdir()
+        tree = dataset_tree(root)
+
+        # The budget covers the drawn entries; the root line and the
+        # truncation marker sit outside it, and say so.
+        assert len(tree.splitlines()) <= TREE_MAX_LINES + 1
+        assert tree.rstrip().endswith("(dataset tree truncated)")
+
+    def test_nothing_readable_means_no_tree(self, tmp_path):
+        assert dataset_tree(None) == ""
+        assert dataset_tree(tmp_path / "does-not-exist") == ""
+        assert dataset_tree(_dataset(tmp_path / "d")["binary"]) == ""
+
+
+class TestFileDigest:
+    def test_a_sidecar_becomes_its_keys(self, tmp_path):
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        digest = file_digest(paths["sidecar"])
+
+        assert "Compiled from sub-01_ses-01_T1w.json" in digest
+        assert "RepetitionTime: 2.0" in digest
+        assert "EchoTime: 0.003" in digest
+
+    def test_a_table_becomes_columns_and_rows(self, tmp_path):
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        digest = file_digest(paths["root"] / "participants.tsv")
+
+        assert "TSV table: 3 columns, 8 data rows" in digest
+        assert "columns: participant_id, age, sex" in digest
+        assert "| sub-01 | 21 | F" in digest
+
+    def test_a_binary_file_is_named_but_never_read(self, tmp_path):
+        """A ``.nii.gz`` is megabytes of floats. The model is told the
+        file exists and that it was *not* inspected — which is what
+        lets it say so instead of describing an image it never saw."""
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        digest = file_digest(paths["binary"])
+
+        assert digest.startswith("Binary file: sub-02_T1w.nii.gz")
+        assert "not inspected" in digest
+        assert "\x1f\x8b" not in digest
+
+    def test_a_text_file_is_summarised_not_shipped(self, tmp_path):
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        long_readme = paths["root"] / "CHANGES"
+        long_readme.write_text(
+            "\n".join(f"change {i}" for i in range(500)), encoding="utf-8")
+
+        digest = file_digest(long_readme)
+
+        assert len(digest.splitlines()) <= DIGEST_MAX_LINES + 2
+        assert "change 0" in digest
+
+    def test_a_table_past_the_cap_says_so(self, tmp_path):
+        """Row counts come from the part that was read — a 400-subject
+        table is already past the cap — so the digest must not let them
+        be quoted as a count of the whole file."""
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        big = paths["root"] / "sessions.tsv"
+        big.write_text(
+            "session_id\tacq\n"
+            + "".join(f"sub-01_ses-{i:02d}\tacq-{i}\n" for i in range(900)),
+            encoding="utf-8",
+        )
+
+        digest = file_digest(big)
+
+        assert "data rows" in digest
+        assert "truncated" in digest
+        assert "counts cover only that part" in digest
+
+    def test_an_extensionless_file_is_still_text(self, tmp_path):
+        """``README``, ``CHANGES`` and ``.bidsignore`` have no suffix to
+        judge them by — and they are plain text, so calling them binary
+        would withhold exactly the file a finding is often about."""
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        digest = file_digest(paths["root"] / "README")
+
+        assert digest.startswith("Text file: README")
+        assert "A dataset." in digest
+
+    def test_a_missing_file_sends_nothing(self, tmp_path):
+        assert file_digest(tmp_path / "nope.json") == ""
+        assert file_digest(None) == ""
+
+
+class TestEvidenceFor:
+    def test_an_explicit_root_reads_a_relative_path(self, tmp_path):
+        from bidsmgr.gui import ai_explainer as mod
+
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        structure, digest = mod._evidence_for(
+            {"path": "sub-01/ses-01/anat/sub-01_ses-01_T1w.json"},
+            paths["root"],
+        )
+
+        assert structure.startswith("my_mri_dataset/")
+        assert "# dataset metadata" in structure
+        assert "RepetitionTime: 2.0" in digest
+
+    def test_an_absolute_path_establishes_its_own_root(self, tmp_path):
+        """The coherence dialog and the issues list hand over a path and
+        nothing else; finding the dataset above it is the only way they
+        get a tree at all."""
+        from bidsmgr.gui import ai_explainer as mod
+
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        structure, digest = mod._evidence_for(
+            {"path": str(paths["bold"])}, None,
+        )
+
+        assert structure.startswith("my_mri_dataset/")
+        assert "participants.tsv" in structure
+        assert "TaskName: rest" in digest
+        assert str(tmp_path) not in structure
+
+    def test_a_relative_path_with_no_root_sends_nothing(self, tmp_path):
+        """Guessing at one would read the wrong file — or somebody
+        else's — so an unresolvable path sends neither field."""
+        from bidsmgr.gui import ai_explainer as mod
+
+        assert mod._evidence_for({"path": "sub-01/func/x.json"}, None) == ("", "")
+        assert mod._evidence_for({}, None) == ("", "")
+
+
+# =====================================================================
 # Transport
 # =====================================================================
 
@@ -268,23 +499,27 @@ class TestTransport:
         # ...and the new question is still its own field, not folded in.
         assert server.received["user_input"] == "And why does it matter?"
 
-    def test_a_long_transcript_is_trimmed_from_the_front(self, stub_agent):
-        """A session's worth of turns would otherwise grow the prompt
-        without bound — and the oldest turns are the least relevant."""
+    def test_a_long_transcript_is_sent_whole(self, stub_agent):
+        """Nothing falls off the front.
+
+        It used to be trimmed to the newest 12 turns so a session could
+        not grow the prompt without limit — but a conversation cut off
+        part way is a model that has forgotten what it was told, which
+        is the worse failure of the two. The whole transcript is what
+        "continue where we left off" has to mean.
+        """
         client, server = stub_agent
         history = [
             {"role": "user" if i % 2 == 0 else "assistant",
              "content": f"turn {i}"}
-            for i in range(HISTORY_SENT + 5)
+            for i in range(40)
         ]
 
         client.predict("now", {"rule_id": "a.b"}, history=history)
 
         sent = server.received["history"]                  # type: ignore[attr-defined]
-        assert len(sent) == HISTORY_SENT
-        assert sent[-1]["content"] == f"turn {HISTORY_SENT + 4}"
-        # Kept from the front of the *end*, so nothing invented appears.
-        assert all(t["content"].startswith("turn ") for t in sent)
+        assert sent == history
+        assert sent[0]["content"] == "turn 0"
 
     def test_junk_in_the_transcript_never_reaches_the_wire(self, stub_agent):
         """Non-dict entries are dropped rather than serialized as-is."""
@@ -292,6 +527,33 @@ class TestTransport:
         client.predict("now", {"rule_id": "a.b"},
                        history=["a string", {"role": "user"}])
         assert "history" not in server.received            # type: ignore[attr-defined]
+
+    def test_dataset_evidence_travels_as_its_own_fields(self, stub_agent):
+        """The tree and the file digest are fields of their own, not
+        more keys inside ``context``: the agent renders each as its own
+        section, and a section it cannot find is a section it cannot
+        print."""
+        client, server = stub_agent
+        client.predict(
+            "Explain it", {"rule_id": "a.b"},
+            dataset_structure="my_dataset/\n└── participants.tsv",
+            file_content="TSV table: 3 columns, 12 data rows",
+        )
+
+        assert server.received["dataset_structure"].startswith("my_dataset/")  # type: ignore[attr-defined]
+        assert "12 data rows" in server.received["file_content"]              # type: ignore[attr-defined]
+        assert "dataset_structure" not in server.received["context"]          # type: ignore[attr-defined]
+        assert "file_content" not in server.received["context"]               # type: ignore[attr-defined]
+
+    def test_absent_evidence_sends_no_field_at_all(self, stub_agent):
+        """A finding with no dataset behind it costs no prompt lines —
+        and an absent key is the only honest way to say "none", since
+        an empty section is a header with nothing under it."""
+        client, server = stub_agent
+        client.predict("Explain it", {"rule_id": "a.b"},
+                       dataset_structure="   ", file_content=None)
+        assert "dataset_structure" not in server.received            # type: ignore[attr-defined]
+        assert "file_content" not in server.received                 # type: ignore[attr-defined]
 
     def test_unreachable_service_says_where_to_start_it(self, dead_url):
         """Not "start it in a terminal": BIDS-Manager does that now."""

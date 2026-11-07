@@ -64,6 +64,20 @@ def _message(qtbot, severity: str, **kwargs) -> ValMessage:
     return msg
 
 
+def _dataset(root):
+    """A tiny dataset: root metadata, a table, one file with a finding."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "dataset_description.json").write_text(
+        '{"Name": "Probe", "BIDSVersion": "1.9.0"}', encoding="utf-8")
+    (root / "participants.tsv").write_text(
+        "participant_id\tage\nsub-01\t24\n", encoding="utf-8")
+    func = root / "sub-01/func"
+    func.mkdir(parents=True, exist_ok=True)
+    (func / "sub-01_task-rest_bold.json").write_text(
+        '{"RepetitionTime": 2.0, "TaskName": "rest"}', encoding="utf-8")
+    return root
+
+
 class _StubAgent(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:               # noqa: D102
         pass
@@ -250,10 +264,10 @@ class TestWhatGetsSent:
     def test_clicking_sends_the_finding_and_the_file(self, qtbot, monkeypatch):
         seen = {}
 
-        def fake_ask(payload, parent=None):
+        def fake_ask(payload, parent=None, root=None):
             seen["payload"] = payload
             seen["parent"] = parent
-            return None
+            seen["root"] = root
 
         monkeypatch.setattr(ai_explainer, "ask", fake_ask)
 
@@ -276,6 +290,82 @@ class TestWhatGetsSent:
         assert payload["path"] == "sub-01/func"
         assert payload["datatype"] == "func"
         assert seen["parent"] is not None
+        # No dataset was handed to this message, so none is claimed.
+        assert seen["root"] is None
+
+    def test_the_dataset_root_travels_to_the_window(
+        self, qtbot, monkeypatch, tmp_path,
+    ):
+        """The window walks the dataset for its shape and reads the
+        file — and it cannot find that dataset itself, because
+        ``context["path"]`` is deliberately relative to the root."""
+        seen = {}
+
+        def fake_ask(payload, parent=None, root=None):
+            seen["root"] = root
+
+        monkeypatch.setattr(ai_explainer, "ask", fake_ask)
+
+        msg = _message(
+            qtbot, "err", context={"path": "sub-01/func"}, root=tmp_path,
+        )
+        qtbot.mouseClick(_ai_buttons(msg)[0], Qt.MouseButton.LeftButton)
+
+        assert seen["root"] == tmp_path
+
+    def test_the_window_sends_the_tree_and_the_file(
+        self, qtbot, stub_agent, tmp_path,
+    ):
+        """The two evidence fields, as they leave the dialog.
+
+        Both are what the agent cannot work out for itself: it never
+        sees the disk. The tree describes the dataset the finding sits
+        in and the digest says what is in the file — and neither
+        carries the folder the dataset was built from, which is the
+        reason ``context["path"]`` is relative in the first place.
+        """
+        _set(ai_base_url=stub_agent.url)
+        root = _dataset(tmp_path / "my_mri_dataset")
+        payload = build_payload(
+            severity="err",
+            message="RepetitionTime is required.",
+            rule_id="evidence.test.tree",
+            extra={"path": "sub-01/func/sub-01_task-rest_bold.json"},
+        )
+
+        dialog = AiExplainDialog(payload, root=root)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received                       # type: ignore[attr-defined]
+        assert sent["dataset_structure"].startswith("my_mri_dataset/")
+        assert "participants.tsv" in sent["dataset_structure"]
+        assert "func/" in sent["dataset_structure"]
+        assert "RepetitionTime: 2.0" in sent["file_content"]
+        assert str(tmp_path) not in sent["dataset_structure"]
+        assert str(tmp_path) not in sent["file_content"]
+
+    def test_no_dataset_means_no_evidence_fields(self, qtbot, stub_agent):
+        """A finding with nothing behind it — no path, no root — must
+        send neither field, not an empty section with a header and
+        nothing under it."""
+        _set(ai_base_url=stub_agent.url)
+        payload = build_payload(
+            severity="warn", message="Something is odd.",
+            rule_id="evidence.test.none",
+        )
+
+        dialog = AiExplainDialog(payload)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received                       # type: ignore[attr-defined]
+        assert "dataset_structure" not in sent
+        assert "file_content" not in sent
 
     def test_ask_is_a_no_op_when_the_feature_is_off(self):
         _set(ai_enabled=False)
@@ -497,6 +587,101 @@ class TestTheConversation:
         assert history[1]["role"] == "assistant"
         # The new question stays its own field rather than joining them.
         assert stub_agent.received["user_input"] == "What is TR?"
+
+    def test_ask_again_re_asks_without_asking_the_question_twice(
+        self, qtbot, stub_agent,
+    ):
+        """The button's whole job is to try again, not to ask again.
+
+        It used to re-send the question on top of a history that already
+        held that same question and its answer, so the model was handed
+        the identical words twice with an answer already attached — and
+        answered as if starting over: "give me the error", with the
+        error in the context the whole time.
+        """
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._retry_btn.click()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received
+        assert sent["user_input"] == ai_explainer.DEFAULT_PROMPT
+        # Nothing came before this question, so nothing travels: the
+        # request is indistinguishable from the first one.
+        assert "history" not in sent
+        # ...and the screen still holds one question and one answer.
+        assert [t["role"] for t in dialog._history] == ["user", "assistant"]
+
+    def test_ask_again_replaces_the_answer_it_is_re_asking_about(
+        self, qtbot, stub_agent,
+    ):
+        """A re-ask regenerates an answer; it does not stack a second.
+
+        Both the question and the answer being replaced are held back
+        from the request: what travels is the conversation that came
+        before them, so the model answers the question again instead of
+        reading an answer it has already given as the reply it owes.
+        """
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._followup.setText("What is TR?")
+        send = next(
+            b for b in dialog.findChildren(QPushButton)
+            if b.objectName() == "val-ai"
+        )
+        qtbot.mouseClick(send, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        dialog._retry_btn.click()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received
+        assert sent["user_input"] == "What is TR?"
+        assert sent["history"] == [
+            {"role": "user", "content": ai_explainer.DEFAULT_PROMPT},
+            {"role": "assistant",
+             "content": "RepetitionTime is the TR of your scan."},
+        ]
+        # One copy of each turn on screen: the new answer took the old
+        # one's place rather than landing under it.
+        assert [t["role"] for t in dialog._history] == [
+            "user", "assistant", "user", "assistant",
+        ]
+
+    def test_a_failed_ask_again_keeps_the_answer_it_was_replacing(
+        self, qtbot, stub_agent, dead_url,
+    ):
+        """Trying again must not cost the answer already on screen.
+
+        Nothing about the transcript changes until the new answer
+        arrives, so a retry into a dead agent leaves the conversation
+        exactly where it was — one click from trying once more.
+        """
+        _set(ai_base_url=stub_agent.url)
+        dialog = AiExplainDialog(self._finding())
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+
+        _set(ai_base_url=dead_url, ai_timeout=5)
+        dialog._retry_btn.click()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        assert not dialog._error.isHidden()
+        assert "RepetitionTime is the TR" in dialog._answer.toPlainText()
+        assert [t["role"] for t in dialog._history] == ["user", "assistant"]
 
     def test_reopening_a_finding_restores_it_and_generates_nothing(
         self, qtbot, stub_agent,

@@ -368,6 +368,9 @@ class CoherenceDialog(QDialog):
                 },
             ),
             parent=self,
+            # The window walks the dataset for its shape and reads the
+            # offending file; the dialog is where the root is known.
+            root=self._root,
         )
 
     # -- selection --------------------------------------------------------

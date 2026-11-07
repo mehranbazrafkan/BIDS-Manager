@@ -20,6 +20,7 @@ Qt-side only. The data is plain: :class:`Finding` and :class:`Group`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dc_field
+from pathlib import Path
 from typing import Any, Optional
 
 from PyQt6.QtCore import (
@@ -365,10 +366,15 @@ class FindingsList(QWidget):
     UNFOLDED = 400
 
     def __init__(self, placeholder: str = "Find a file, a rule or a word",
-                 parent=None) -> None:
+                 parent=None, root=None) -> None:
         super().__init__(parent)
         from ..viz import fonts
         from .search_field import SearchField, find_shortcut
+
+        # The dataset these findings belong to, if the host knows one.
+        # Handed to the AI window beside the file path so it can show
+        # the agent the shape of the dataset and read the file itself.
+        self._root = root
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -458,8 +464,31 @@ class FindingsList(QWidget):
             self._detail_hint.setVisible(True)
             return
         self._detail_hint.setVisible(False)
+        # Which file this finding is on, when the group is a file. Kept
+        # relative to the dataset — a prompt must not carry the
+        # reviewer's home directory — with the root handed over beside
+        # it, so the explainer can walk the dataset and read the file.
+        # A group that is a table row has neither to give.
+        ctx: Optional[dict] = None
+        root = self._root
+        if isinstance(group.key, Path):
+            if root is None:
+                from ...viz.bids import dataset_root
+
+                root = dataset_root(group.key)
+            path = group.key
+            if root is not None:
+                try:
+                    path = group.key.resolve().relative_to(
+                        Path(root).resolve()
+                    )
+                except (OSError, ValueError):
+                    path = group.key
+            ctx = {"path": path.as_posix()}
         message = ValMessage(finding.severity, finding.rule, finding.message,
                              finding.fix_label, finding.field, finding.schema_rule,
+                             context=ctx,
+                             root=root,
                              parent=self._detail)
         message.fix_requested.connect(
             lambda field, key=group.key: self.fix_requested.emit(key, field))
