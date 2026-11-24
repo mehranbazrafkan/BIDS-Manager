@@ -45,6 +45,7 @@ from uuid import uuid4
 import pandas as pd
 
 from ..util.oplog import add_log_arguments, dataset_root_for, log_keywords, logged
+from ..util.paths import missing_folder_message
 from .. import schema
 from ..classifier import dcm2niix_bidsguess, sequence_dict
 from ..classifier.types import Classification
@@ -694,6 +695,143 @@ def _detect_aborts(
                     verdicts[k_e] = "suspected_abort"
 
     return verdicts
+
+
+def _entities_from_names(rows: list[InventoryRow], chosen: dict[str, Classification],
+                         wanted, df: pd.DataFrame) -> dict[str, Classification]:
+    """The wanted entities the series description (else the protocol name)
+    states, laid over each row's classification (``inventory.name_entities``)."""
+    from ..inventory import name_entities as by_name
+
+    features = df.attrs.get("features_by_uid") or {}
+    rows_by_id = {r.row_id.hex: r for r in rows}
+    for key, c in list(chosen.items()):
+        row = rows_by_id.get(key)
+        if row is None or c.skip:
+            continue
+        protocol = next((str((features.get(uid) or {}).get("protocol", "") or "")
+                         for uid in (row.series_uid or "").split("|")
+                         if (features.get(uid) or {}).get("protocol")), "")
+        entities, changed = by_name.apply(c.candidate_entities, c.datatype, c.suffix, wanted,
+                                          row.series_description or "", protocol)
+        if changed:
+            note = "from the sequence name: " + ", ".join(
+                f"{k}-{v}" for k, v in changed.items())
+            chosen[key] = c.model_copy(update={
+                "candidate_entities": entities,
+                "rationale": f"{c.rationale}; {note}" if c.rationale else note})
+    return chosen
+
+
+#: Siemens' distortion-correction markers: ``ND`` is the image as acquired,
+#: ``DIS2D``/``DIS3D`` the same acquisition reconstructed with the gradient
+#: non-linearity corrected (``features._distortion_marker``).
+_CORRECTED = {"DIS2D", "DIS3D"}
+_ND_DESCRIPTION_RE = _re.compile(r"[_\-\s]ND$", _re.IGNORECASE)
+
+
+def _flip_label(angle) -> str:
+    """``35.0`` -> ``fa35``, ``7.5`` -> ``fa7p5`` (a BIDS label is alphanumeric)."""
+    value = float(angle)
+    text = str(int(value)) if value.is_integer() else f"{value:g}".replace(".", "p")
+    return f"fa{text}"
+
+
+def _name_megre_protocols(rows: list[InventoryRow], chosen: dict[str, Classification],
+                          df: pd.DataFrame) -> dict[str, Classification]:
+    """Tell multi-echo GRE (``anat/MEGRE``) protocols apart by what differs.
+
+    A session may hold two MEGRE protocols at different flip angles, each
+    reconstructed twice (with and without distortion correction), and every
+    one as magnitude and phase. BIDS has no ``flip`` entity for MEGRE (it
+    belongs to VFA/MPM), so ``run-1`` to ``run-4`` was all that kept the
+    names apart, and a run means "the same acquisition repeated", which
+    these are not. Within a subject and session:
+
+    - protocols that differ in flip angle get ``acq-fa<angle>`` (``acq-fa35``,
+      ``acq-fa14``) in place of a shared acquisition label that told them
+      nothing apart;
+    - a reconstruction without distortion correction (Siemens ``ND``) gets
+      ``rec-nd`` when the corrected reconstruction of it is here too.
+
+    Rows of any other suffix, and rows a scan rule named, are left alone.
+    """
+    features = df.attrs.get("features_by_uid") or {}
+    rows_by_id = {r.row_id.hex: r for r in rows}
+
+    def facts(row) -> dict:
+        for uid in (row.series_uid or "").split("|"):
+            if features.get(uid):
+                return features[uid]
+        return {}
+
+    megre = {}
+    for key, c in chosen.items():
+        row = rows_by_id.get(key)
+        if (row is None or c.skip or c.datatype != "anat" or c.suffix != "MEGRE"
+                or c.classifier.startswith("user_hint")):
+            continue
+        megre[key] = (row, facts(row))
+    if len(megre) < 2:
+        return chosen
+
+    notes: dict[str, list[str]] = defaultdict(list)
+
+    def without(entities: dict, *names: str) -> tuple:
+        return _entity_signature({k: v for k, v in entities.items() if k not in names})
+
+    # 1. Flip angles. Magnitude and phase of one protocol share an angle, so
+    #    they are grouped together (``part`` and ``echo`` left out of the key).
+    groups: dict[tuple, list[str]] = defaultdict(list)
+    for key, (row, _f) in megre.items():
+        c = chosen[key]
+        groups[(row.subject_hint or "", row.session_hint or "",
+                without(c.candidate_entities, "part", "echo", "reconstruction"))].append(key)
+    for members in groups.values():
+        angles = {key: megre[key][1].get("flip_angle") for key in members}
+        if None in angles.values() or len(set(angles.values())) < 2:
+            continue
+        shown = ", ".join(f"{a:g}" for a in sorted(set(angles.values()), reverse=True))
+        for key in members:
+            label = _flip_label(angles[key])
+            chosen[key].candidate_entities["acquisition"] = label
+            notes[key].append(f"acq-{label}: the MEGRE protocols differ in flip angle "
+                              f"({shown} degrees)")
+
+    # 2. Reconstructions of one acquisition (same entities, part included).
+    groups = defaultdict(list)
+    for key, (row, _f) in megre.items():
+        c = chosen[key]
+        if c.candidate_entities.get("reconstruction"):
+            continue
+        groups[(row.subject_hint or "", row.session_hint or "",
+                without(c.candidate_entities, "echo"))].append(key)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        marks = {key: str(megre[key][1].get("distortion") or "").upper() for key in members}
+        if any(marks.values()):
+            uncorrected = [k for k, m in marks.items() if m == "ND"]
+            corrected = [k for k, m in marks.items() if m in _CORRECTED]
+        else:  # no marker in the header: the description's ``_ND`` and its twin
+            names = {k: (megre[k][0].series_description or "").strip() for k in members}
+            uncorrected = [k for k, n in names.items() if _ND_DESCRIPTION_RE.search(n)]
+            plain = {_ND_DESCRIPTION_RE.sub("", names[k]).lower() for k in uncorrected}
+            corrected = [k for k, n in names.items()
+                         if k not in uncorrected and n.lower() in plain]
+        if not uncorrected or not corrected:
+            continue
+        for key in uncorrected:
+            chosen[key].candidate_entities["reconstruction"] = "nd"
+            notes[key].append("rec-nd: reconstructed without distortion correction "
+                              "(the corrected reconstruction is named without rec)")
+
+    for key, lines in notes.items():
+        c = chosen[key]
+        note = "; ".join(lines)
+        chosen[key] = c.model_copy(update={
+            "rationale": f"{c.rationale}; {note}" if c.rationale else note})
+    return chosen
 
 
 def _normalize_runs(
@@ -1349,7 +1487,7 @@ def _flag_ct_companion_rows(df: pd.DataFrame) -> None:
 _SUB_LABEL_RE = _re.compile(r"^sub-(\d+)$")
 
 
-def _renumber_subjects_after(df: pd.DataFrame, others) -> None:
+def _renumber_subjects_after(df: pd.DataFrame, others, keep=frozenset()) -> None:
     """Shift ``df``'s ``sub-NNN`` labels past those already used in ``others``.
 
     Every modality scanner numbers its own subjects from ``sub-001``. Merging
@@ -1360,7 +1498,8 @@ def _renumber_subjects_after(df: pd.DataFrame, others) -> None:
     the user renames rows in the inventory to merge them deliberately.
 
     Rewrites ``participant_id`` plus the ``entities`` / basename columns derived
-    from it, so the row stays internally consistent.
+    from it, so the row stays internally consistent. Rows in ``keep`` (index
+    labels) are left as they are: already given a subject on purpose.
     """
     if df.empty or "participant_id" not in df.columns:
         return
@@ -1378,7 +1517,10 @@ def _renumber_subjects_after(df: pd.DataFrame, others) -> None:
 
     offset = max(used)
     remap: dict[str, str] = {}
-    for label in df["participant_id"].astype(str):
+    for idx in df.index:
+        if idx in keep:
+            continue
+        label = str(df.at[idx, "participant_id"])
         m = _SUB_LABEL_RE.match(label.strip())
         if m and label not in remap:
             remap[label] = f"sub-{int(m.group(1)) + offset:03d}"
@@ -1386,23 +1528,77 @@ def _renumber_subjects_after(df: pd.DataFrame, others) -> None:
         return
 
     for idx in df.index:
-        old = str(df.at[idx, "participant_id"]).strip()
-        new = remap.get(old)
-        if not new:
+        if idx in keep:
             continue
-        df.at[idx, "participant_id"] = new
-        token = new[len("sub-"):]
-        if "entities" in df.columns:
-            try:
-                ents = json.loads(df.at[idx, "entities"] or "{}")
-            except (TypeError, ValueError):
-                ents = {}
-            if ents.get("subject"):
-                ents["subject"] = token
-                df.at[idx, "entities"] = json.dumps(ents, sort_keys=True)
-        for col in ("bids_name", "bids_path"):
-            if col in df.columns:
-                df.at[idx, col] = str(df.at[idx, col]).replace(old, new, 1)
+        new = remap.get(str(df.at[idx, "participant_id"]).strip())
+        if new:
+            _relabel_row(df, idx, new)
+
+
+def _relabel_row(df: pd.DataFrame, idx, new: str) -> None:
+    """Give one row the participant ``new``: ``participant_id`` and the
+    ``entities`` / basename columns derived from it, so the row stays
+    internally consistent."""
+    old = str(df.at[idx, "participant_id"]).strip()
+    df.at[idx, "participant_id"] = new
+    token = new[len("sub-"):]
+    if "entities" in df.columns:
+        try:
+            ents = json.loads(df.at[idx, "entities"] or "{}")
+        except (TypeError, ValueError):
+            ents = {}
+        if ents.get("subject"):
+            ents["subject"] = token
+            df.at[idx, "entities"] = json.dumps(ents, sort_keys=True)
+    for col in ("bids_name", "bids_path"):
+        if col in df.columns and old:
+            df.at[idx, col] = str(df.at[idx, col]).replace(old, new, 1)
+
+
+_PARTICIPANT_FOLDER_RE = _re.compile(r"^sub-[A-Za-z0-9]+$", _re.IGNORECASE)
+
+
+def _participant_folder(relpath: str) -> str:
+    """The ``sub-<label>`` folder a path relative to the scanned root lies
+    in, lower-cased, or ``""``. Splits on both separators: on Windows the
+    stored paths use backslashes."""
+    for part in _re.split(r"[\\/]", str(relpath or "")):
+        if _PARTICIPANT_FOLDER_RE.match(part):
+            return part.lower()
+    return ""
+
+
+def _join_folder_subject(df: pd.DataFrame, others) -> set:
+    """Give a row the subject of its participant folder when EVERY other
+    recording in that ``sub-`` folder was given one and the same subject.
+
+    For the eye tracker, whose files name no participant: it used to be
+    shifted past every label in use (``_renumber_subjects_after``) even when
+    its folder plainly belonged to one subject, so a one-person tree came out
+    as two subjects. The join is narrow on purpose. A folder whose other
+    recordings carry several subjects (identities the user still has to
+    reconcile), a folder with nothing else in it, and a file in no ``sub-``
+    folder all keep the separate number, so two people are never put
+    together by the scan. Returns the index labels joined.
+    """
+    subjects: dict[str, set[str]] = {}
+    for other in others:
+        if other is None or other.empty or "participant_id" not in other.columns:
+            continue
+        for idx in other.index:
+            label = str(other.at[idx, "participant_id"] or "").strip()
+            where = str(other.at[idx, "source_folder"]) if "source_folder" in other.columns else ""
+            folder = _participant_folder(where)
+            if label and folder:
+                subjects.setdefault(folder, set()).add(label)
+    joined = set()
+    for idx in df.index:
+        where = str(df.at[idx, "source_folder"]) if "source_folder" in df.columns else ""
+        labels = subjects.get(_participant_folder(where), set())
+        if len(labels) == 1:
+            _relabel_row(df, idx, next(iter(labels)))
+            joined.add(idx)
+    return joined
 
 
 def _classify_pet_rows(df: pd.DataFrame) -> None:
@@ -1812,7 +2008,7 @@ def _unified_column_order(df: pd.DataFrame) -> list[str]:
     """Final unified TSV column order. Locked contract:
 
     ``TSV(24) + BIDS_GUESS(8) + ENTITIES(1) + DATASET(1) + PROBE(4) +
-    EXTENDED(3) + EEG_MEG(16) + PET(5) + CURATION(4) = 66``.
+    EXTENDED(3) + EEG_MEG(16) + PET(5) + CURATION(5) = 67``.
 
     The ``entities`` column carries the canonical JSON-encoded BIDS
     entity dict; the converter and ``bidsmgr-rebuild`` use it as the
@@ -1997,6 +2193,8 @@ def _apply_index_widths(df: "pd.DataFrame", widths: dict[str, int]) -> int:
      "scan rules": f"{len(a['user_hints'] or [])} hint(s), "
                    f"{len(a['exclusions'] or [])} exclusion(s)",
      "entities left out": ", ".join(a["drop_entities"] or ()) or "none",
+     "subject labels from": a["subject_from"],
+     "entities the sequence name decides": ", ".join(a["name_entities"] or ()) or "none",
      "acquisition parameters": (a["classifier_config"].general.mode
                                 if a["classifier_config"] is not None else "applied")}))
 def run_scan(
@@ -2016,6 +2214,8 @@ def run_scan(
     index_widths: Optional[dict[str, int]] = None,
     classifier_config=None,
     drop_entities: Optional[list[str]] = None,
+    subject_from: str = "number",
+    name_entities: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     """Run the full scan pipeline and return the DataFrame written to TSV.
 
@@ -2054,13 +2254,26 @@ def run_scan(
         Short entity keys (``acq``, ``run``) to leave out of the proposed
         names, wherever the standard does not require them and they do not
         tell two recordings apart (``inventory.leave_out``).
+    subject_from
+        Where DICOM subjects' labels come from: ``"number"`` (default),
+        ``"patient_id"``, ``"given_name"`` or ``"family_name"``, curated into
+        a BIDS label and numbered where empty (``inventory.subject_label``).
+    name_entities
+        Short entity keys (``acq``, ``task``, ``run``) whose value the series
+        description or protocol name decides when it states one, over the
+        scan's estimate (``inventory.name_entities``).
     """
+
+    if not Path(dicom_root).is_dir():
+        # Said here, before any scanner walks nothing: on Windows the usual
+        # cause is a mapped drive this process cannot see.
+        raise NotADirectoryError(missing_folder_message(dicom_root))
 
     dataset_slug = dataset if dataset else _default_dataset_slug(dicom_root)
 
     df = scan_dicoms_long(
         dicom_root, output_tsv=None, n_jobs=n_jobs, dataset=dataset_slug,
-        cancel_check=cancel_check,
+        cancel_check=cancel_check, subject_from=subject_from,
     )
 
     # Honour a Stop requested during the (dominant) DICOM read before
@@ -2097,7 +2310,11 @@ def run_scan(
     df_eye = scan_eyetrack(Path(dicom_root), dataset=dataset_slug or "",
                            cancel_check=cancel_check)
     if not df_eye.empty:
-        _renumber_subjects_after(df_eye, (df, df_eeg))
+        # An EyeLink file names no participant: it joins the subject of its
+        # participant folder when that folder is plainly one person's, and
+        # takes a number of its own otherwise.
+        joined = _join_folder_subject(df_eye, (df, df_eeg))
+        _renumber_subjects_after(df_eye, (df, df_eeg), keep=joined)
         df_eeg = (
             df_eye if df_eeg.empty
             else pd.concat([df_eeg, df_eye], ignore_index=True, sort=False)
@@ -2156,8 +2373,13 @@ def run_scan(
                                      forced=forced)
 
     chosen = _reroute_b0_references_to_fmap_epi(rows, chosen)
+    chosen = _name_megre_protocols(rows, chosen, df)
     abort_verdicts = _detect_aborts(rows, chosen)
     chosen = _normalize_runs(rows, chosen, abort_verdicts)
+    # Last, so what the operator wrote wins over every estimate above,
+    # the run numbering included.
+    if name_entities:
+        chosen = _entities_from_names(rows, chosen, name_entities, df)
 
     probe_stats: dict[str, ProbeFileStats] = {}
     if probe_convert:
@@ -2351,6 +2573,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--subject-from", choices=("number", "patient-id", "given-name", "family-name"),
+        default="number",
+        help=(
+            "Where DICOM subjects' labels come from: numbers (sub-001, default), or "
+            "the patient ID, given name or family name, curated into a BIDS label "
+            "(letters and digits; accents and spaces go). A subject whose field is "
+            "empty or anonymised is numbered; two whose values match are kept apart "
+            "with a number."
+        ),
+    )
+    parser.add_argument(
+        "--name-entity", action="append", default=[], metavar="ENTITY",
+        help=(
+            "Let the sequence name decide ENTITY (a short key such as acq, task or "
+            "run): when the series description or protocol name states it "
+            "(func_task-nback_acq-mb4), that value wins over the scan's estimate. "
+            "Repeat it, or give several separated by commas: --name-entity acq,task."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase log verbosity (-v INFO, -vv DEBUG)",
     )
@@ -2421,6 +2663,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error(
             f"--drop-entity cannot leave out {', '.join(unknown)}. Choose from: "
             + ", ".join(offered()) + " (sub, ses and task name the recording).")
+    from ..inventory import name_entities as _by_name
+
+    try:
+        name_entities = _by_name.parse_list(",".join(args.name_entity))
+    except ValueError as exc:
+        parser.error(f"--name-entity: {exc}")
+    subject_from = args.subject_from.replace("-", "_")
 
     user_hints: Optional[list[UserHint]] = None
     exclusions: Optional[list[ExclusionRule]] = None
@@ -2470,6 +2719,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             user_hints=user_hints, exclusions=exclusions,
             classifier_config=classifier_config,
             drop_entities=drop_entities,
+            subject_from=subject_from,
+            name_entities=name_entities,
             **log_keywords(args),
         )
         version = import_scan_as_version(
@@ -2497,6 +2748,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         exclusions=exclusions,
         classifier_config=classifier_config,
         drop_entities=drop_entities,
+        subject_from=subject_from,
+        name_entities=name_entities,
         **log_keywords(args),
     )
     return 0

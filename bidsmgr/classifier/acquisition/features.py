@@ -266,6 +266,41 @@ def _shim(protocol: dict) -> Optional[tuple]:
     return tuple(out)
 
 
+#: Siemens image-type tokens for the gradient non-linearity (distortion)
+#: correction a reconstruction had: none (ND), 2-D, 3-D.
+_DISTORTION_TOKENS = ("ND", "DIS2D", "DIS3D")
+
+
+def _distortion_marker(ds) -> str:
+    """``"ND"``, ``"DIS2D"``, ``"DIS3D"`` or ``""``: the distortion correction
+    the series was reconstructed with, as Siemens states it.
+
+    A scanner that saves both reconstructions of one acquisition (the
+    original, ``ND``, and the corrected one) gives them the same parameters,
+    so this is what tells them apart. Classic files put the token in
+    ImageType; XA enhanced files in the image-type text of a private group
+    (0021,1175) inside the first frame (or the shared groups)."""
+    tokens = set(_tokens(_get(ds, "ImageType")))
+    if not tokens & set(_DISTORTION_TOKENS):
+        for groups in ("SharedFunctionalGroupsSequence", "PerFrameFunctionalGroupsSequence"):
+            items = _get(ds, groups)
+            if not items:
+                continue
+            try:
+                elements = list(items[0])
+            except TypeError:
+                continue
+            for element in elements:
+                if getattr(element, "VR", "") != "SQ" or not element.value:
+                    continue
+                inner = element.value[0]
+                if (0x0021, 0x1175) in inner:
+                    tokens |= set(_tokens(inner[(0x0021, 0x1175)].value))
+            if tokens & set(_DISTORTION_TOKENS):
+                break
+    return next((t for t in _DISTORTION_TOKENS if t in tokens), "")
+
+
 def series_facts(ds) -> dict:
     """What one file says about its whole series (constant across it)."""
     manufacturer = str(_get(ds, "Manufacturer", "") or "")
@@ -354,6 +389,7 @@ def series_facts(ds) -> dict:
             factor = None
         if factor and factor > 1:
             facts["epi_flag"] = "YES"
+    facts["distortion"] = _distortion_marker(ds)
     # An enhanced file holds the whole series: what varies is in its frames.
     frames = _get(ds, "PerFrameFunctionalGroupsSequence")
     if frames:
@@ -449,6 +485,9 @@ class SeriesFeatures:
     columns: Optional[float] = None
     slice_thickness: Optional[float] = None
     pixel_spacing: Optional[float] = None          # mm, in plane
+    #: Siemens distortion correction: "ND" (none), "DIS2D", "DIS3D" or "".
+    #: Not scored; it tells two reconstructions of one acquisition apart.
+    distortion: str = ""
 
     def to_dict(self) -> dict:
         out = asdict(self)
@@ -607,6 +646,7 @@ def build(files: Iterable[dict], series: dict, *, n_files: int) -> SeriesFeature
         rows=rows,
         columns=columns,
         slice_thickness=series.get("slice_thickness"),
+        distortion=series.get("distortion") or "",
     )
     return feats
 

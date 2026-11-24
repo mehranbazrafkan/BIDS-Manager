@@ -62,24 +62,77 @@ def test_a_plain_epi_reference_gets_no_gradient_tables() -> None:
     assert not any(p.endswith((".bval", ".bvec")) for p in _paths(plan))
 
 
-def test_a_series_with_several_echoes_is_split_and_said_so() -> None:
+def test_a_series_with_several_echoes_is_named_echo_by_echo() -> None:
+    """dcm2niix splits it into one file per echo and the conversion names each
+    by the echo entity (``dcm2niix_direct.echo_basename``): the preview says
+    the same names, with each echo's own time."""
     rows = [_row("sub-01", "sub-01_task-x_bold", "func", uid="u1")]
-    plan = plan_output(pd.DataFrame(rows), features={"u1": SeriesFeatures(echo_times=[12.0, 30.0])})
-    split = [f for f in plan.files if "_e" in f.path]
-    assert sorted(f.path.rsplit("/", 1)[-1] for f in split) == [
-        "sub-01_task-x_bold_e1.json", "sub-01_task-x_bold_e1.nii.gz",
-        "sub-01_task-x_bold_e2.json", "sub-01_task-x_bold_e2.nii.gz"]
-    assert all("not included" in f.warning for f in split)
+    feats = {"u1": SeriesFeatures(echo_times=[12.0, 30.0])}
+    plan = plan_output(pd.DataFrame(rows), features=feats)
+    func = sorted(f.path.rsplit("/", 1)[-1] for f in plan.files if "/func/" in f.path)
+    assert func == ["sub-01_task-x_echo-1_bold.json", "sub-01_task-x_echo-1_bold.nii.gz",
+                    "sub-01_task-x_echo-2_bold.json", "sub-01_task-x_echo-2_bold.nii.gz"]
+    assert not any(f.warning for f in plan.files if "/func/" in f.path)
     assert "sub-01/func/sub-01_task-x_bold.nii.gz" not in _paths(plan)
+    second = next(f for f in plan.files if f.path.endswith("echo-2_bold.json"))
+    fields = {k: v for k, v, _src in approximate(pd.DataFrame(rows), second,
+                                                 features=feats).fields}
+    assert fields["EchoTime"] == 0.03 and fields["EchoNumber"] == 2
+
+
+def test_a_megre_series_keeps_its_part_and_gets_each_echo() -> None:
+    rows = [_row("sub-01", "sub-01_acq-fa35_echo-1_part-mag_MEGRE", "anat", uid="u1")]
+    plan = plan_output(pd.DataFrame(rows),
+                       features={"u1": SeriesFeatures(echo_times=[8.2, 13.4, 19.1])})
+    anat = sorted(f.path.rsplit("/", 1)[-1] for f in plan.files
+                  if "/anat/" in f.path and f.path.endswith(".nii.gz"))
+    assert anat == [f"sub-01_acq-fa35_echo-{k}_part-mag_MEGRE.nii.gz" for k in (1, 2, 3)]
+
+
+def test_echoes_a_suffix_cannot_name_are_split_and_said_so() -> None:
+    """``dwi`` has no echo entity: the files keep dcm2niix's tails, which the
+    validator lists as not included, and the preview warns."""
+    rows = [_row("sub-01", "sub-01_dwi", "dwi", uid="u1")]
+    plan = plan_output(pd.DataFrame(rows), features={"u1": SeriesFeatures(echo_times=[80.0, 120.0])})
+    split = [f for f in plan.files if "_e" in f.path.rsplit("/", 1)[-1]]
+    assert sorted(f.path.rsplit("/", 1)[-1] for f in split) == [
+        "sub-01_dwi_e1.json", "sub-01_dwi_e1.nii.gz", "sub-01_dwi_e2.json", "sub-01_dwi_e2.nii.gz"]
+    assert all("not included" in f.warning for f in split)
+
+
+def test_uncompressed_images_are_predicted_as_nii() -> None:
+    rows = [_row("sub-01", "sub-01_T1w", "anat", uid="u1"),
+            _row("sub-01", "sub-01_task-x_bold", "func", uid="u2"),
+            _row("sub-01", "sub-01_magnitude1", "fmap", uid="u3|u4")]
+    feats = {"u2": SeriesFeatures(echo_times=[12.0, 30.0]),
+             "u3": SeriesFeatures(echo_times=[4.92, 7.38])}
+    plan = plan_output(pd.DataFrame(rows), options=PlanOptions(compress=False), features=feats)
+    images = {f.path for f in plan.files if ".nii" in f.path}
+    assert images == {"sub-01/anat/sub-01_T1w.nii", "sub-01/func/sub-01_task-x_echo-1_bold.nii",
+                      "sub-01/func/sub-01_task-x_echo-2_bold.nii", "sub-01/fmap/sub-01_magnitude1.nii",
+                      "sub-01/fmap/sub-01_magnitude2.nii", "sub-01/fmap/sub-01_phasediff.nii"}
 
 
 def test_physio_is_one_file_per_signal_when_it_has_several() -> None:
     rows = [_row("sub-01", "sub-01_task-rest_physio", "func", uid="p1")]
     plan = plan_output(pd.DataFrame(rows))
     maybe = _paths(plan, sure=False)
-    for signal in ("cardiac", "ecg", "respiratory", "trigger"):
+    for signal in ("cardiac", "ecg", "respiratory", "externalTrigger"):
         assert f"sub-01/func/sub-01_task-rest_recording-{signal}_physio.tsv.gz" in maybe
     assert "sub-01/func/sub-01_task-rest_physio.tsv.gz" in maybe
+    # The scanner trigger is a column of every table, never a table of its own.
+    assert not any("recording-trigger" in p for p in maybe)
+
+
+def test_physio_as_one_table_for_the_run() -> None:
+    from bidsmgr.converter.output_plan import PlanOptions
+
+    rows = [_row("sub-01", "sub-01_task-rest_physio", "func", uid="p1")]
+    plan = plan_output(pd.DataFrame(rows), None, PlanOptions(physio_layout="one_as_recorded"))
+    sure = _paths(plan)
+    assert "sub-01/func/sub-01_task-rest_physio.tsv.gz" in sure
+    assert "sub-01/func/sub-01_task-rest_physio.json" in sure
+    assert not any("recording-" in p for p in _paths(plan, sure=False))
     assert not any(p.endswith("_scans.tsv") for p in _paths(plan)), \
         "physio is not a row of the scans table"
 

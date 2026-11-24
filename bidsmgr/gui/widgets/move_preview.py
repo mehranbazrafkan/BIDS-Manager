@@ -65,12 +65,14 @@ class MovePreviewTree(QTreeWidget):
         extras: Iterable[tuple[str, str]] = (),
         conflicts: Iterable[str] = (),
         checked: Optional[set[str]] = None,
+        left: Iterable[tuple[str, str]] = (),
     ) -> None:
         """Draw ``moves`` as ``(key, source, destination)``, nested by folder.
 
         ``extras`` are the things that follow and cannot be chosen separately
         (a folder that empties, a table that merges, a reference that travels).
-        ``conflicts`` are the reasons the plan cannot go ahead.
+        ``conflicts`` are the reasons the plan cannot go ahead. ``left`` are
+        files in the scope the plan leaves as they are, with why.
 
         ``checked`` is which keys start ticked; ``None`` ticks everything.
         Opening on one file the user right-clicked should offer THAT file, not
@@ -99,6 +101,7 @@ class MovePreviewTree(QTreeWidget):
             "Refused, these names would collide",
             ((text, "") for text in conflicts),
         )
+        self._add_section("Left as they are", left)
 
         self.blockSignals(False)
         self._expand(count)

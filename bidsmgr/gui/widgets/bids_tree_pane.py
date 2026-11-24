@@ -217,6 +217,20 @@ def _sidecar_entry(root: Path, scope: list) -> Optional[tuple[str, bool]]:
     return "Write its sidecar from the recording...", False
 
 
+def _compression_entry(scope: list[Path]) -> str:
+    """The right-click words for compressing what was clicked: the direction
+    when every picked file is an image of one form, else both."""
+    names = [p.name for p in scope]
+    if all(p.is_file() for p in scope) and names:
+        if all(n.endswith(".nii.gz") for n in names):
+            return ("Decompress this image (.nii)..." if len(names) == 1
+                    else f"Decompress these {len(names)} images (.nii)...")
+        if all(n.endswith(".nii") for n in names):
+            return ("Compress this image (.nii.gz)..." if len(names) == 1
+                    else f"Compress these {len(names)} images (.nii.gz)...")
+    return "Compress or decompress images..."
+
+
 def _can_restructure(path: Path) -> bool:
     """Is it meaningful to change the entities of what was clicked?
 
@@ -464,6 +478,9 @@ class BidsTreePane(QWidget):
     #: Write or complete sidecars from the clicked recordings: ``(paths,
     #: whether to add to sidecars that are there)``.
     sidecars_requested = pyqtSignal(list, bool)
+    #: Compress or decompress the clicked images (files or folders).
+    #: ``list[Path]``.
+    compression_requested = pyqtSignal(list)
     #: Put the clicked images side by side. ``list[Path]``, one or two.
     compare_requested = pyqtSignal(list)
     #: Open the references tool on the clicked file. ``list[Path]``, one file.
@@ -1548,6 +1565,16 @@ class BidsTreePane(QWidget):
             session.triggered.connect(
                 lambda _c=False, s=scope, m=mode:
                     self.entities_requested.emit(s, m, True)
+            )
+
+            squeeze = menu.addAction(_compression_entry(scope))
+            squeeze.setToolTip(
+                "Write these NIfTI images as .nii.gz or as .nii: the same image, both "
+                "valid BIDS. The scans tables, IntendedFor and every other file that "
+                "names them follow. Shows every image first; one undoable step."
+            )
+            squeeze.triggered.connect(
+                lambda _c=False, s=scope: self.compression_requested.emit(s)
             )
 
             menu_section(menu, "Identifiable data")

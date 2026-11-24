@@ -96,11 +96,18 @@ class ChildStep:
     existed: bool        # was there a file here before?
     # Only for "rename": where it came from, so undo can move it back.
     origin: str = ""
+    # Only for a "delete" by :meth:`Operation.set_aside`: the file that took
+    # this one's place holding the same data in another form (an image
+    # compressed or decompressed). The copy kept is then not an earlier
+    # version of anything, which is what ``deface.compare`` needs to know.
+    same_as: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out = {"kind": self.kind, "path": self.path, "existed": self.existed}
         if self.origin:
             out["origin"] = self.origin
+        if self.same_as:
+            out["same_as"] = self.same_as
         return out
 
 
@@ -263,6 +270,44 @@ class Operation:
             shutil.copy2(path, dest)
         self.children.append(ChildStep(kind="delete", path=rel, existed=True))
         path.unlink()
+
+    def set_aside(self, path: Path, *, same_as: Optional[Path] = None) -> None:
+        """Remove ``path`` by MOVING it among the copies kept for undo.
+
+        :meth:`delete` without the copy, for a file replaced as a whole by
+        another of a new name: an image compressed or decompressed is tens of
+        megabytes each, and copying a dataset's worth aside before removing
+        it would double the time and the disk for nothing. Undo puts it back
+        exactly as it puts back a deleted file. ``same_as`` names the file
+        that now holds the same data (see :attr:`ChildStep.same_as`).
+        """
+        path = Path(path)
+        if not path.exists():
+            return
+        rel = self._rel(path)
+        if any(step.path == rel for step in self.children):
+            # Saved already: what was there when the operation started is kept.
+            self.delete(path)
+            return
+        dest = self.originals_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest))          # a rename on one file system
+        self.children.append(ChildStep(
+            kind="delete", path=rel, existed=True,
+            same_as=self._rel(same_as) if same_as is not None else "",
+        ))
+
+    def adopt(self, path: Path, source: Path) -> None:
+        """Put ``source``, a file this operation wrote beside ``path`` (same
+        folder, so the move is a rename), at ``path``, reversibly and
+        without a copy: :meth:`replace_from` for a file too large to copy
+        twice."""
+        path, source = Path(path), Path(source)
+        if not source.is_file():
+            raise OperationError(f"{source} is not a file")
+        self._backup(path)
+        self._ensure_dir(path.parent)
+        os.replace(source, path)
 
     def rename(self, src: Path, dst: Path) -> None:
         """Move ``src`` to ``dst``, recording where it came from.
@@ -629,7 +674,7 @@ def _restore(root: Path, op_id: str, children: list[ChildStep]) -> int:
 def _children(record: dict[str, Any]) -> list[ChildStep]:
     return [
         ChildStep(kind=c["kind"], path=c["path"], existed=c["existed"],
-                  origin=c.get("origin", ""))
+                  origin=c.get("origin", ""), same_as=c.get("same_as", ""))
         for c in record.get("children", [])
     ]
 

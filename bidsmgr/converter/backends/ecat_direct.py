@@ -127,7 +127,7 @@ class EcatDirect:
         out_dir = out_dir / task.datatype
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        nii_path = out_dir / f"{task.basename}.nii.gz"
+        nii_path = out_dir / f"{task.basename}{'.nii.gz' if task.compress else '.nii'}"
         json_path = out_dir / f"{task.basename}.json"
 
         try:

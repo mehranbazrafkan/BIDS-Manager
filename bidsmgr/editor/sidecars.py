@@ -642,7 +642,7 @@ def _from_source(project: _Project, recording: Path, sidecar_name: str,
             if sources is None or sources.root is None:
                 project.converted[row_id] = {"": "the scan does not say where its data is"}
             else:
-                from ..cli.convert import sidecars_for_row
+                from ..cli.convert import TaskOptions, sidecars_for_row
 
                 row = row.copy()
                 # Named as it was converted, so the outputs carry the names the
@@ -651,9 +651,17 @@ def _from_source(project: _Project, recording: Path, sidecar_name: str,
                 row["datatype"] = str(task.get("datatype", "")) or row.get("datatype", "")
                 if task.get("suffix"):
                     row["bids_guess_suffix"] = str(task["suffix"])
+                # And converted as it was: the volumes removed then, the
+                # physiology's layout, not what the table or settings say now.
+                row["drop_volumes"] = ""
+                options = TaskOptions(
+                    drop_volumes=int(task.get("drop_volumes") or 0),
+                    physio_layout=str(task.get("physio_layout") or "by_rate"),
+                    physio_align=bool(task.get("physio_align", False)))
                 try:
                     project.converted[row_id] = sidecars_for_row(
-                        row, work / f"row{len(project.converted)}", sources, spec=spec)
+                        row, work / f"row{len(project.converted)}", sources, spec=spec,
+                        options=options)
                 except Exception as exc:  # noqa: BLE001 - reported per file
                     log.debug("source conversion failed for %s", row_id, exc_info=True)
                     project.converted[row_id] = {"": _short(exc)}

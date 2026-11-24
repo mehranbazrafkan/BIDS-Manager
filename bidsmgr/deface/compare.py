@@ -20,6 +20,11 @@ for two different reasons:
     The EARLIEST operation holding a given path is the pristine one: a second
     defacing of the same image saves the already-defaced version.
 
+An image compressed or decompressed since (``editor.compression``) keeps its
+original under its earlier name, so both places are searched under every name
+the image has had. The copy that operation kept is the SAME image in another
+form, not an earlier version, and never counts as the original.
+
 There is a third case with no original at all, and it is not a failure: an
 image defaced during conversion never had an undefaced version inside the
 dataset, which is the entire point of doing it there. Saying that plainly is
@@ -64,37 +69,76 @@ class Original:
         return "the copy kept in the edit history"
 
 
+def _posix(text) -> str:
+    return str(text or "").replace("\\", "/")
+
+
+def _renamed_by_encoding(records: list[dict]) -> dict[str, str]:
+    """``{old name: new name}`` for every image an operation compressed or
+    decompressed (a step that records ``same_as``)."""
+    out: dict[str, str] = {}
+    for record in records:
+        for child in record.get("children", []):
+            if child.get("same_as"):
+                out[_posix(child.get("path"))] = _posix(child["same_as"])
+    return out
+
+
+def names_of(root: Path, rel: str, records: Optional[list[dict]] = None) -> list[str]:
+    """``rel`` and every earlier name of the same image, newest first."""
+    renamed = _renamed_by_encoding(read_log(root) if records is None else records)
+    earlier = {new: old for old, new in renamed.items()}
+    out = [_posix(rel)]
+    while out[-1] in earlier and earlier[out[-1]] not in out:
+        out.append(earlier[out[-1]])
+    return out
+
+
+def current_name(root: Path, rel: str, records: Optional[list[dict]] = None) -> str:
+    """The name an image known as ``rel`` has now."""
+    renamed = _renamed_by_encoding(read_log(root) if records is None else records)
+    seen = [_posix(rel)]
+    while seen[-1] in renamed and renamed[seen[-1]] not in seen:
+        seen.append(renamed[seen[-1]])
+    return seen[-1]
+
+
 def original_for(root: Path, rel: str) -> Optional[Original]:
     """The undefaced copy of ``rel``, or ``None`` if the dataset has none.
 
     ``sourcedata/`` wins when both exist. It is never overwritten, so it is
     pristine by construction, whereas the history only goes back as far as the
-    operations still in the log.
+    operations still in the log. Both are searched under every name the image
+    has had (:func:`names_of`).
     """
     root = Path(root)
-    rel = str(rel).replace("\\", "/")
+    records = read_log(root)
+    names = names_of(root, rel, records)
 
-    mirror = root / SOURCEDATA / rel
-    if mirror.is_file():
-        return Original(path=mirror, source=SOURCEDATA)
+    for name in names:
+        mirror = root / SOURCEDATA / name
+        if mirror.is_file():
+            return Original(path=mirror, source=SOURCEDATA)
 
     # Oldest first: the first operation that saved this path holds the version
-    # from before anything was done to it.
-    for record in read_log(root):
+    # from before anything was done to it. A copy kept by a change of
+    # compression is the same image, not an earlier one.
+    for record in records:
         op_id = record.get("op_id", "")
         if not op_id:
             continue
-        if not any(
-            str(child.get("path", "")).replace("\\", "/") == rel
-            for child in record.get("children", [])
-        ):
-            continue
-        kept = root / ORIGINALS_DIR / op_id / rel
-        if kept.is_file():
-            return Original(
-                path=kept, source="history", op_id=op_id,
-                label=str(record.get("label", "")),
-            )
+        for name in names:
+            if not any(
+                _posix(child.get("path")) == name and not child.get("same_as")
+                for child in record.get("children", [])
+            ):
+                continue
+            kept = root / ORIGINALS_DIR / op_id / name
+            if kept.is_file():
+                return Original(
+                    path=kept, source="history", op_id=op_id,
+                    label=str(record.get("label", "")),
+                )
     return None
 
 
@@ -139,27 +183,30 @@ def comparable(root: Path) -> list[str]:
     """
     root = Path(root)
     out: set[str] = set()
+    records = read_log(root)
 
     mirror_root = root / SOURCEDATA
     if mirror_root.is_dir():
         for path in mirror_root.rglob("*.nii*"):
-            rel = path.relative_to(mirror_root).as_posix()
+            rel = current_name(root, path.relative_to(mirror_root).as_posix(), records)
             if (root / rel).is_file():
                 out.add(rel)
 
-    for record in read_log(root):
+    for record in records:
         op_id = record.get("op_id", "")
         if not op_id:
             continue
         kept_root = root / ORIGINALS_DIR / op_id
         for child in record.get("children", []):
-            rel = str(child.get("path", "")).replace("\\", "/")
-            if not rel.endswith((".nii", ".nii.gz")):
+            rel = _posix(child.get("path"))
+            if not rel.endswith((".nii", ".nii.gz")) or child.get("same_as"):
                 continue
-            if (kept_root / rel).is_file() and (root / rel).is_file():
-                out.add(rel)
+            now = current_name(root, rel, records)
+            if (kept_root / rel).is_file() and (root / now).is_file():
+                out.add(now)
 
     return sorted(out)
 
 
-__all__ = ["Original", "SOURCEDATA", "comparable", "explain_missing", "original_for"]
+__all__ = ["Original", "SOURCEDATA", "comparable", "current_name", "explain_missing",
+           "names_of", "original_for"]

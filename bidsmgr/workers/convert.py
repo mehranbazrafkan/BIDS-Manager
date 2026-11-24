@@ -85,6 +85,7 @@ class ConvertWorker(QThread):
         recording_meta: Optional[Path] = None,
         raw_root: Optional[Path] = None,
         skip_residuals: bool = True,
+        compress: bool = True,
         preserve_curation: bool = True,
         force_edf: bool = False,
         deface: bool = False,
@@ -93,6 +94,9 @@ class ConvertWorker(QThread):
         b0_field: bool = True,
         sourcedata: str = "none",
         sourcedata_modalities: str = "",
+        drop_volumes: int = 0,
+        physio_layout: str = "by_rate",
+        physio_align: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -106,6 +110,7 @@ class ConvertWorker(QThread):
         self._recording_meta = Path(recording_meta) if recording_meta is not None else None
         self._raw_root = Path(raw_root) if raw_root is not None else None
         self._skip_residuals = skip_residuals
+        self._compress = compress
         self._preserve_curation = preserve_curation
         self._force_edf = force_edf
         self._deface = deface
@@ -114,6 +119,9 @@ class ConvertWorker(QThread):
         self._b0_field = b0_field
         self._sourcedata = sourcedata
         self._sourcedata_modalities = sourcedata_modalities
+        self._drop_volumes = drop_volumes
+        self._physio_layout = physio_layout
+        self._physio_align = physio_align
         # Cooperative stop flag, polled by ``run_convert`` between subjects
         # and between per-subject tasks.
         self._stop = threading.Event()
@@ -154,6 +162,7 @@ class ConvertWorker(QThread):
                 recording_meta=self._recording_meta,
                 raw_root=self._raw_root,
                 skip_residuals=self._skip_residuals,
+                compress=self._compress,
                 preserve_curation=self._preserve_curation,
                 force_edf=self._force_edf,
                 deface=self._deface,
@@ -163,6 +172,9 @@ class ConvertWorker(QThread):
                 b0_field=self._b0_field,
                 sourcedata=self._sourcedata,
                 sourcedata_modalities=self._sourcedata_modalities,
+                drop_volumes=self._drop_volumes,
+                physio_layout=self._physio_layout,
+                physio_align=self._physio_align,
             )
             if rc == 130 or self._stop.is_set():
                 # 130 = run_convert's "stopped before all subjects" code.

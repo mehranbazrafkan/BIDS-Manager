@@ -66,6 +66,11 @@ class ConvertTask(BaseModel):
     # DWI ``.bval``/``.bvec``) is never affected. Set False to keep them.
     skip_residuals: bool = True
 
+    # NIfTI images written compressed (``.nii.gz``, the default) or not
+    # (``.nii``). BIDS accepts both; some tools (older SPM, MATLAB scripts)
+    # read only the uncompressed form. Settings > Convert, ``--no-compress``.
+    compress: bool = True
+
     # EEG/MEG-specific: per-row knobs the inventory TSV carries. The CLI
     # resolves these (cell, else recording-metadata default) before building
     # the task. ``line_freq`` / ``montage`` are applied during the write;
@@ -92,6 +97,18 @@ class ConvertTask(BaseModel):
     #: For a fieldmap: the row ids of the runs the USER chose for it to
     #: correct (``fieldmap_targets`` in the inventory); empty = the rule.
     fieldmap_targets: tuple[str, ...] = ()
+    #: Volumes removed from the start of a 4-D functional image (dummy
+    #: scans): the image, its sidecar, its events and its physiology then
+    #: start at the first volume kept. For a physio row: its run's value.
+    drop_volumes: int = 0
+    #: Physiology: ``"by_rate"`` (one table per sampling rate, as recorded),
+    #: ``"one_interpolated"`` (one table, slower channels interpolated to the
+    #: fastest rate) or ``"one_as_recorded"`` (one table, n/a between a slower
+    #: channel's samples).
+    physio_layout: str = "by_rate"
+    #: Physiology: crop the tables to the run (first volume kept to the end of
+    #: the last), so ``StartTime`` is 0.
+    physio_align: bool = False
 
     @model_validator(mode="before")
     @classmethod

@@ -150,7 +150,7 @@ def revert_dataset(
                     )
                     continue
 
-                op.replace_from(item.path, item.original.path)
+                _restore_image(op, item.path, item.original.path)
 
                 sidecar = status.sidecar_for(item.path)
                 doc = status.read_sidecar(sidecar)
@@ -175,6 +175,23 @@ def revert_dataset(
         log.warning("revert rolled back at %s: %s", where, exc)
 
     return outcome
+
+
+def _restore_image(op, target: Path, original: Path) -> None:
+    """Put ``original`` at ``target``, re-encoded when the image has been
+    compressed or decompressed since the original was kept: its bytes copied
+    as they are would be gzip data in a ``.nii``, or the other way round."""
+    if original.name.endswith(".gz") == target.name.endswith(".gz"):
+        op.replace_from(target, original)
+        return
+    import tempfile
+
+    from ..editor.compression import transcode
+
+    with tempfile.TemporaryDirectory(prefix="bidsmgr-revert-") as tmp:
+        staged = Path(tmp) / target.name
+        transcode(original, staged, compress=target.name.endswith(".gz"))
+        op.replace_from(target, staged)
 
 
 __all__ = ["RevertOutcome", "Revertable", "revert_dataset", "revertable"]

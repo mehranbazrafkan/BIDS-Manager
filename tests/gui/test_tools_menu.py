@@ -75,6 +75,9 @@ def test_the_menu_holds_the_dataset_wide_actions(panel: EditorPanel) -> None:
         "Rename entity...",
         "Find and replace a value...",
         "Index widths...",
+        # Changes the extension of every image and the names that follow,
+        # nothing else: a names tool, beside the house-style one.
+        "Compress or decompress images...",
         "Add or remove an entity...",
         "Sessions...",
 

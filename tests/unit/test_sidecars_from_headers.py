@@ -347,8 +347,9 @@ def _project(root: Path, monkeypatch, produced: dict, answers=None) -> None:
 
         return pd.Series({"series_uid": row_id, "bids_name": "renamed_since"}), _Sources(), None
 
-    def fake_convert(row, work_dir, sources, *, spec=None):
+    def fake_convert(row, work_dir, sources, *, spec=None, options=None):
         calls.append(row["bids_name"])
+        calls.append(options)
         return produced
 
     monkeypatch.setattr(sidecars._Project, "row", row)
@@ -376,8 +377,27 @@ def test_the_source_data_comes_first(tmp_path, monkeypatch):
     assert fields["MultibandAccelerationFactor"] == (4, HEADER)
     assert one.read[0] == "the data it was converted from, converted again"
     assert headers.ROUNDED_TE in " ".join(one.notes)
-    # Converted under the name it had at conversion, whatever the table says now.
-    assert calls == ["1.2.3", "sub-01_task-rest_bold"]
+    # Converted under the name it had at conversion, whatever the table says now,
+    # and with the options it had then (none recorded: the defaults).
+    from bidsmgr.cli.convert import TaskOptions
+
+    assert calls == ["1.2.3", "sub-01_task-rest_bold", TaskOptions()]
+
+
+def test_the_source_is_converted_with_the_options_it_was_converted_with(tmp_path, monkeypatch):
+    """Dummy volumes and the physiology layout as recorded at conversion, not
+    what the table or Settings say now."""
+    from bidsmgr.cli.convert import TaskOptions
+
+    root = _dataset(tmp_path)
+    _nifti(root / "sub-01/func/sub-01_task-rest_bold.nii.gz", (4, 4, 3, 5), tr=0.85)
+    calls = _project(root, monkeypatch, {"sub-01_task-rest_bold.json": {"EchoTime": 0.03}})
+    prov = root / ".bidsmgr/provenance/sub-01.json"
+    record = json.loads(prov.read_text())
+    record["tasks"][0].update(drop_volumes=3, physio_layout="one_as_recorded", physio_align=True)
+    prov.write_text(json.dumps(record))
+    plan_sidecars(root)
+    assert calls[-1] == TaskOptions(drop_volumes=3, physio_layout="one_as_recorded", physio_align=True)
 
 
 def test_without_source_data_the_reason_is_given(tmp_path, monkeypatch):

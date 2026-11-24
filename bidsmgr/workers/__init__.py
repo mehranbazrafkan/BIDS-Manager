@@ -17,6 +17,7 @@ The viewers' reads, filters and spectra run on
 visualisation library).
 """
 
+from .compression import CompressionWorker
 from .convert import ConvertWorker
 from .deface import DefaceRevertWorker, DefaceWorker
 from .file_report import FileReportWorker, FolderReportWorker
@@ -27,6 +28,7 @@ from .tsv_loader import TsvLoaderWorker
 from .validate import ValidateWorker
 
 __all__ = [
+    "CompressionWorker",
     "ConvertWorker",
     "DefaceRevertWorker",
     "DefaceWorker",

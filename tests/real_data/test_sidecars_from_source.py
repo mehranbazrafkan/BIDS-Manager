@@ -15,9 +15,9 @@ GUI does it. Then:
   disagrees with what the conversion wrote, beyond the echo time's two
   significant figures.
 
-Gated on ``BIDS_MANAGER_REAL_MRI_DATA``; the sample lives beside the raw data
-(``sample_datasets/2026-10/BIDS_Manager_multimodal_sample_v2``), as for the
-BIDS preview's real-data test.
+Gated on ``BIDS_MANAGER_REAL_MRI_DATA``; the published multimodal sample is
+downloaded once and cached (``tests/fixtures/sample_data``), as for the BIDS
+preview's real-data test.
 """
 
 from __future__ import annotations
@@ -29,19 +29,20 @@ from pathlib import Path
 
 import pytest
 
-from tests.fixtures.data_root import data_root
-
-_ROOT = data_root()
-SAMPLE = (_ROOT.parent / "sample_datasets" / "2026-10" / "BIDS_Manager_multimodal_sample_v2"
-          if _ROOT is not None else None)
+from tests.fixtures import sample_data
 
 pytestmark = [
     pytest.mark.real_data,
     pytest.mark.skipif(not os.environ.get("BIDS_MANAGER_REAL_MRI_DATA"),
                        reason="BIDS_MANAGER_REAL_MRI_DATA not set"),
-    pytest.mark.skipif(SAMPLE is None or not SAMPLE.exists(),
-                       reason=f"multimodal sample missing at {SAMPLE}"),
 ]
+
+
+def _sample() -> Path:
+    """The published multimodal sample, downloaded once and cached
+    (``tests/fixtures/sample_data``): the folder holding ``raw/`` and its
+    spreadsheets. Skips when it cannot be had."""
+    return sample_data.require("multimodal").parent
 
 #: Fields that link one sidecar to another: gone when every sidecar is.
 LINKS = {"IntendedFor", "B0FieldIdentifier", "B0FieldSource"}
@@ -51,9 +52,10 @@ LINKS = {"IntendedFor", "B0FieldIdentifier", "B0FieldSource"}
 def project(tmp_path_factory) -> Path:
     from bidsmgr.cli import convert, create, scan
 
+    sample = _sample()
     ds = tmp_path_factory.mktemp("sidecars") / "study"
     assert create.main([str(ds)]) == 0
-    assert scan.main([str(SAMPLE / "raw"), "--project", str(ds), "-j", "2"]) == 0
+    assert scan.main([str(sample / "raw"), "--project", str(ds), "-j", "2"]) == 0
     assert convert.main(["--project", str(ds)]) == 0
     assert (ds / ".bidsmgr" / "provenance").is_dir()
     return ds
