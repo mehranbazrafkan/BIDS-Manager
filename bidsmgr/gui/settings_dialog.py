@@ -1795,6 +1795,57 @@ class SettingsDialog(QDialog):
         chat_log_row.addWidget(chat_log_open_btn, 0)
         form.addRow("Chat logs saved in:", chat_log_row)
 
+        # -- the request side of every finding --------------------------
+        # One click writes what a question would send for every error and
+        # warning, without generating: the files are a dataset for review
+        # and fine-tuning, and they land inside the chat-log path because
+        # that is where the user already looks. Each run gets its own
+        # timestamped folder, so an annotated run is never overwritten.
+        export_row = QHBoxLayout()
+        export_row.setSpacing(8)
+        self._ai_full_data_btn = QPushButton("Save full data for all warnings and errors")
+        self._ai_full_data_btn.setToolTip(
+            "Write the full prompt record of every error and warning in "
+            "the current validation report — one JSON file per finding, "
+            "in a full-data folder inside the chat-log path.\n\n"
+            "No answer is generated: the agent runs retrieval and "
+            "assembles the same system prompt, context and user prompt a "
+            "real question would carry, and nothing else. The local model "
+            "is not loaded, so this is quick and costs no GPU time.\n\n"
+            "Open the dataset in the Editor and run “Validate dataset” "
+            "first. Each run gets its own timestamped folder, so files "
+            "you annotate are never overwritten. Mirrored duplicates are "
+            "left out; accepted findings are included."
+        )
+        self._ai_full_data_btn.clicked.connect(self._export_full_data)
+        self._ai_full_data_open = QPushButton("Open folder")
+        self._ai_full_data_open.setEnabled(False)
+        self._ai_full_data_open.setToolTip(
+            "Open the last complete export in your file manager."
+        )
+        self._ai_full_data_open.clicked.connect(self._open_full_data_folder)
+        export_row.addWidget(self._ai_full_data_btn, 0)
+        export_row.addWidget(self._ai_full_data_open, 0)
+        export_row.addStretch(1)
+        form.addRow("Dataset export:", export_row)
+
+        self._ai_full_data_info = QLabel(
+            "One request record per error and warning, without an AI answer."
+        )
+        self._ai_full_data_info.setWordWrap(True)
+        self._ai_full_data_info.setStyleSheet("color: #8b949e;")
+        self._ai_full_data_info.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        form.addRow("", self._ai_full_data_info)
+
+        self._ai_full_data_bar = QProgressBar()
+        self._ai_full_data_bar.setVisible(False)
+        self._ai_full_data_bar.setRange(0, 1)
+        form.addRow("", self._ai_full_data_bar)
+        self._ai_full_data_worker = None
+        self._ai_full_data_dir = Path()
+
         # -- how much it is allowed to write ---------------------------
         self._ai_tokens = QSpinBox()
         self._ai_tokens.setRange(16, 8192)
@@ -2162,6 +2213,113 @@ class SettingsDialog(QDialog):
         path = logs_dir(self._ai_chat_log_dir.text().strip())
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _current_dataset(self):
+        """The Editor's dataset and validation report, if one is open."""
+        win = self.parent()
+        editor = getattr(win, "editor", None)
+        if editor is None:
+            return None, None
+        try:
+            return editor.current_root(), editor.current_report()
+        except Exception:                              # pragma: no cover
+            return None, None
+
+    def _export_full_data(self) -> None:
+        """Write the full prompt record of every error and warning.
+
+        The prompts are built by the agent — retrieval and rendering only,
+        no generation — so the files are exactly what a question would
+        send. It runs in a thread: a report can hold thousands of findings
+        and each one retrieves.
+        """
+        from .ai_full_data import ExportWorker, collect_requests, start_export
+
+        worker = self._ai_full_data_worker
+        if worker is not None and worker.isRunning():
+            return
+        if not agent_service.service().is_running():
+            self._full_data_message(
+                "Start the AI agent above first: the prompts are built by "
+                "the agent, which is where retrieval runs.",
+                warning=True,
+            )
+            return
+        root, report = self._current_dataset()
+        if root is None or report is None:
+            self._full_data_message(
+                "Open a dataset in the Editor and run “Validate dataset” "
+                "first: there is no validation report to export.",
+                warning=True,
+            )
+            return
+        requests = collect_requests(report)
+        if not requests:
+            self._full_data_message(
+                "The current validation report has no errors or warnings."
+            )
+            return
+        self._ai_full_data_btn.setEnabled(False)
+        self._ai_full_data_bar.setRange(0, len(requests))
+        self._ai_full_data_bar.setValue(0)
+        self._ai_full_data_bar.setVisible(True)
+        self._full_data_message(
+            f"Building {len(requests)} request records — no model is being "
+            "run…"
+        )
+        worker = ExportWorker(
+            requests, root, self._ai_chat_log_dir.text().strip(),
+        )
+        worker.progress.connect(self._full_data_progress)
+        worker.finished_with.connect(self._full_data_finished)
+        self._ai_full_data_worker = start_export(worker)
+
+    def _full_data_progress(self, done: int, total: int) -> None:
+        self._ai_full_data_bar.setValue(done)
+        self._full_data_message(
+            f"Writing {done} of {total} request records…"
+        )
+
+    def _full_data_finished(self, result: dict) -> None:
+        self._ai_full_data_worker = None
+        self._ai_full_data_btn.setEnabled(True)
+        self._ai_full_data_bar.setVisible(False)
+        folder = str(result.get("folder") or "")
+        if folder:
+            self._ai_full_data_dir = Path(folder)
+        self._ai_full_data_open.setEnabled(
+            bool(folder) and Path(folder).is_dir()
+        )
+        saved = int(result.get("saved") or 0)
+        failed = result.get("failed") or []
+        aborted = str(result.get("aborted") or "")
+        where = folder or "the export folder"
+        if aborted:
+            self._full_data_message(
+                f"Saved {saved} of the request records to {where}, then "
+                f"stopped: {aborted}",
+                warning=True,
+            )
+            return
+        text = f"Saved {saved} full-data files to {where}."
+        if failed:
+            text += (
+                f" {len(failed)} could not be built; the manifest lists "
+                "which and why."
+            )
+        self._full_data_message(text)
+
+    def _full_data_message(self, text: str, *, warning: bool = False) -> None:
+        self._ai_full_data_info.setStyleSheet(
+            "color: #d29922;" if warning else "color: #8b949e;"
+        )
+        self._ai_full_data_info.setText(text)
+
+    def _open_full_data_folder(self) -> None:
+        """Open the last complete export in the file manager."""
+        folder = self._ai_full_data_dir
+        if folder and folder.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _download_selected_model(self) -> None:
         """Start downloading the selected model, then show its progress.

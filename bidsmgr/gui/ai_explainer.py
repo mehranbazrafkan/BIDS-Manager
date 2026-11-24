@@ -1001,6 +1001,49 @@ class AgentClient:
             )
         return out
 
+    def build_prompt(
+        self,
+        user_input: str,
+        context: dict,
+        dataset_structure: Optional[str] = None,
+        file_content: Optional[str] = None,
+    ) -> dict:
+        """``POST /prompt`` — the request ``/predict`` would send, built.
+
+        Retrieval and prompt rendering run in the agent; no checkpoint is
+        loaded and no answer is generated. Used by the Settings dataset
+        export, which writes one record per finding.
+
+        The optional evidence is the same two pieces :meth:`predict`
+        sends: a condensed dataset tree and a compiled file digest. Both
+        are omitted when there is nothing to say.
+        """
+        body: dict[str, Any] = {
+            "user_input": str(user_input),
+            "context": dict(context),
+        }
+        for key, value in (
+            ("dataset_structure", dataset_structure),
+            ("file_content", file_content),
+        ):
+            text = str(value or "").strip()
+            if text:
+                body[key] = text
+        try:
+            out = self._request("POST", "/prompt", body)
+        except AgentError as exc:
+            if getattr(exc, "status", None) == 404:
+                raise AgentError(
+                    "The AI agent does not support full-data export — it "
+                    "is an older version. Update the AI Agent module in "
+                    "Settings and try again.",
+                    status=404,
+                ) from exc
+            raise
+        out.setdefault("system_prompt", "")
+        out.setdefault("user_prompt", str(user_input))
+        return out
+
 
 def llm_config_payload(settings: Any) -> dict:
     """The ``PUT /config`` body built from stored LLM preferences.

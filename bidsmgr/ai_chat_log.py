@@ -56,23 +56,26 @@ def logs_dir(override: str | Path = "") -> Path:
     return Path(text).expanduser() if text else default_dir()
 
 
-def _name_for(key: str) -> str:
-    """A safe, stable file name for one conversation.
+def file_stem(key: str) -> str:
+    """A safe, stable file name stem for one finding.
 
     Stable because the same finding should keep appending to the same
     file across sessions; digest-suffixed because two different findings
     can sanitize to the same slug (paths differing only in a character
     that became a dash), and silently mixing them would be worse than an
     uglier name.
+
+    Public because the dataset export writes its own files beside the
+    conversations and names them the same way: one finding, one stem.
     """
-    slug = _UNSAFE.sub("-", key).strip("-._")
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    slug = _UNSAFE.sub("-", str(key or "")).strip("-._")
+    digest = hashlib.sha1(str(key or "").encode("utf-8")).hexdigest()[:8]
     return f"{slug[:60] or 'conversation'}-{digest}"
 
 
 def conversation_file(key: str, folder: str | Path = "") -> Path:
     """The JSONL file one conversation appends to."""
-    return logs_dir(folder) / f"{_name_for(key)}.jsonl"
+    return logs_dir(folder) / f"{file_stem(key)}.jsonl"
 
 
 def write_turn(
@@ -118,6 +121,7 @@ __all__ = [
     "DEFAULT_FOLDER_NAME",
     "conversation_file",
     "default_dir",
+    "file_stem",
     "logs_dir",
     "write_turn",
 ]
