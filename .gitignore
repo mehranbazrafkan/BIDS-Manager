@@ -24,6 +24,9 @@ htmlcov/
 .bidsmgr/
 preferences.json
 
+# Local agent tooling state (sessions, loop logs)
+.opencode/
+
 # Real-data fixtures (paths kept out of repo)
 tests/real_data/data/
 
