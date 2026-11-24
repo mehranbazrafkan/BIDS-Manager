@@ -2398,7 +2398,7 @@ class AiLogDialog(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(build_header(
-            "Prompt log", "What the model was fed for this answer",
+            "Prompt log", "What the model was fed, and the answer it produced",
         ))
 
         scroll, body = scrollable_body()
