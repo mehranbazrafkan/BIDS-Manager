@@ -1,20 +1,19 @@
 """Export the request side of every validation finding.
 
-Settings → AI Agent offers one button that writes the "full data" of every
-error and warning in the current validation report: the system prompt the
-agent would send (instructions, retrieved BIDS knowledge, issue context,
-and the optional dataset structure and file digest), the user prompt, and
-how the request was routed — with no answer generated and no model loaded.
+Settings → AI Agent offers one button that writes a prompt log for every
+error and warning in the current validation report: the complete system
+prompt the agent would send (instructions, issue context, retrieved BIDS
+knowledge, and the optional dataset structure and file digest) followed by
+the user prompt, with no answer generated and no model loaded.
 
-The point is a dataset, not a conversation. Each record is the input half
-of a fine-tuning pair (``output`` is deliberately ``null``), and the
-retrieved evidence in ``system_prompt`` shows where the knowledge base
-helped and where it did not, so the same files serve a knowledge-base
-review.
+The point is a dataset, not a conversation. Each UTF-8 ``.log`` file is the
+input half of a fine-tuning pair and can be read exactly as the model would
+receive it. The retrieved evidence shows where the knowledge base helped
+and where it did not, so the same files serve a knowledge-base review.
 
 Every export gets its own timestamped folder inside the chat-log path, so
 a run that has been annotated is never overwritten by the next one. One
-JSON file per finding, plus a manifest describing the run.
+``.log`` file per finding, plus a JSON manifest describing the run.
 """
 
 from __future__ import annotations
@@ -44,9 +43,9 @@ from .ai_explainer import (
 
 log = logging.getLogger(__name__)
 
-#: Version of the record shape. Bumped if the keys change enough that a
-#: reader (or a fine-tuning script) would have to handle two formats.
-FORMAT = "bidsmgr-ai-full-data/1"
+#: Version of the export/manifest shape. Bumped when a reader (or a
+#: fine-tuning script) would have to handle two formats.
+FORMAT = "bidsmgr-ai-prompt-log/1"
 
 #: Characters a folder name may keep; everything else becomes a dash.
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -111,7 +110,7 @@ def collect_requests(report: ValidationReport) -> list[FindingRequest]:
 def export_folder(folder: str | Path, root: str | Path) -> Path:
     """A new folder for one export, inside the chat-log path.
 
-    Timestamped so re-running never overwrites records that have been
+    Timestamped so re-running never overwrites logs that have been
     reviewed or annotated; the dataset's own folder name makes a run
     recognisable without opening its manifest. A second export in the
     same second gets a numeric suffix rather than sharing the folder.
@@ -131,22 +130,22 @@ def export_records(
     requests: list[FindingRequest],
     root: str | Path,
     folder: str | Path,
-    build: Callable[..., dict],
+    build: Callable[..., str],
     *,
     include_dataset_structure: bool = True,
     include_file_content: bool = True,
     on_progress: Optional[Callable[[int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict:
-    """Build and write every request; return the run's summary.
+    """Build and write every prompt log; return the run's summary.
 
-    *build* is :meth:`AgentClient.build_prompt` in the app and a plain
+    *build* is :meth:`AgentClient.build_prompt_log` in the app and a plain
     function in tests: naming, evidence and writing do not need a server.
     The dataset tree and the file digest are compiled here and cached per
     folder/file, because a report can hold thousands of findings over the
     same handful of paths. ``include_dataset_structure`` and
     ``include_file_content`` follow the Settings checkboxes: an unchecked
-    section is neither walked/read nor written into the prompt record.
+    section is neither walked/read nor written into the prompt log.
 
     An agent that cannot be reached aborts the run after what was already
     written; a single request the agent rejects is recorded as a failure
@@ -180,7 +179,7 @@ def export_records(
                     dataset_tree(root_path, focus=focus)
                     if include_dataset_structure else ""
                 )
-            built = build(
+            text = build(
                 request.prompt,
                 request.payload,
                 dataset_structure=trees[focus],
@@ -189,11 +188,9 @@ def export_records(
                     if include_file_content else ""
                 ),
             )
-            record = _record(request, built)
-            target = run_dir / f"{file_stem(request.key)}.json"
+            target = run_dir / f"{file_stem(request.key)}.log"
             target.write_text(
-                json.dumps(record, ensure_ascii=False, indent=2, default=str)
-                + "\n",
+                text if text.endswith("\n") else text + "\n",
                 encoding="utf-8",
                 newline="\n",
             )
@@ -208,7 +205,7 @@ def export_records(
         except OSError as exc:
             result["failed"].append({"key": request.key, "error": str(exc)})
         except Exception as exc:                       # pragma: no cover
-            log.exception("could not export full data for %s", request.key)
+            log.exception("could not export prompt log for %s", request.key)
             result["failed"].append({
                 "key": request.key,
                 "error": f"{type(exc).__name__}: {exc}",
@@ -259,7 +256,7 @@ class ExportWorker(QThread):
                 self._requests,
                 self._root,
                 self._folder,
-                client.build_prompt,
+                client.build_prompt_log,
                 include_dataset_structure=self._include_dataset_structure,
                 include_file_content=self._include_file_content,
                 on_progress=self.progress.emit,
@@ -375,32 +372,6 @@ def _digest_for(
     return cache[key]
 
 
-def _record(request: FindingRequest, built: dict) -> dict:
-    """The on-disk record: exactly the request side of one answer."""
-    return {
-        "format": FORMAT,
-        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "key": request.key,
-        "finding": request.payload,
-        "intent": str(built.get("intent") or ""),
-        "classification_source": str(
-            built.get("classification_source") or ""
-        ),
-        "prompt_available": bool(built.get("prompt_available", True)),
-        "system_prompt": str(built.get("system_prompt") or ""),
-        "user_prompt": str(built.get("user_prompt") or request.prompt),
-        "output": None,
-        "retrieval": {
-            "found": built.get("retrieval_found"),
-            "quality": built.get("retrieval_quality"),
-        },
-        "note": (
-            "No answer was generated: this is the request side of the "
-            "prompt, saved for review, knowledge-base work and fine-tuning."
-        ),
-    }
-
-
 def _write_manifest(
     run_dir: Path,
     root: Path,
@@ -416,9 +387,9 @@ def _write_manifest(
         "failed": result["failed"],
         "aborted": result["aborted"],
         "note": (
-            "Each .json file holds the prompt a real question would send "
-            "(system_prompt, user_prompt, intent, retrieval outcome) and "
-            "no answer. `output` is null for that reason."
+            "Each .log file holds the complete system prompt a real question "
+            "would send and the user prompt, with no answer. One log belongs "
+            "to one validation finding."
         ),
     }
     try:
@@ -429,7 +400,7 @@ def _write_manifest(
             newline="\n",
         )
     except OSError as exc:                             # pragma: no cover
-        log.warning("could not write the full-data manifest: %s", exc)
+        log.warning("could not write the prompt-log manifest: %s", exc)
 
 
 __all__ = [

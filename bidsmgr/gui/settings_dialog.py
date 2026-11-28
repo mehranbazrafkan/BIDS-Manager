@@ -1970,14 +1970,17 @@ class SettingsDialog(QDialog):
         # timestamped folder, so an annotated run is never overwritten.
         export_row = QHBoxLayout()
         export_row.setSpacing(8)
-        self._ai_full_data_btn = QPushButton("Save full data for all warnings and errors")
+        self._ai_full_data_btn = QPushButton(
+            "Save prompt logs for all warnings and errors"
+        )
         self._ai_full_data_btn.setToolTip(
-            "Write the full prompt record of every error and warning in "
-            "the current validation report — one JSON file per finding, "
-            "in a full-data folder inside the chat-log path.\n\n"
-            "No answer is generated: the agent runs retrieval and "
-            "assembles the same system prompt, context and user prompt a "
-            "real question would carry, and nothing else. The local model "
+            "Write one complete prompt log for every error and warning in "
+            "the current validation report — one UTF-8 .log file per "
+            "finding, in a full-data folder inside the chat-log path.\n\n"
+            "Each file holds the full system prompt (instructions, issue, "
+            "file digest, dataset structure and retrieved BIDS knowledge) "
+            "and the user prompt. No answer is generated: the agent runs "
+            "retrieval and assembles the request side only. The local model "
             "is not loaded, so this is quick and costs no GPU time.\n\n"
             "Open the dataset in the Editor and run “Validate dataset” "
             "first. Each run gets its own timestamped folder, so files "
@@ -1997,7 +2000,7 @@ class SettingsDialog(QDialog):
         form.addRow("Dataset export:", export_row)
 
         self._ai_full_data_info = QLabel(
-            "One request record per error and warning, without an AI answer."
+            "One prompt log per error and warning, without an AI answer."
         )
         self._ai_full_data_info.setWordWrap(True)
         self._ai_full_data_info.setStyleSheet("color: #8b949e;")
@@ -2396,12 +2399,12 @@ class SettingsDialog(QDialog):
             return None, None
 
     def _export_full_data(self) -> None:
-        """Write the full prompt record of every error and warning.
+        """Write one prompt log for every error and warning.
 
         The prompts are built by the agent — retrieval and rendering only,
-        no generation — so the files are exactly what a question would
-        send. It runs in a thread: a report can hold thousands of findings
-        and each one retrieves.
+        no generation — so each file is exactly what a question would send,
+        with no answer. It runs in a thread: a report can hold thousands of
+        findings and each one retrieves.
         """
         from .ai_full_data import ExportWorker, collect_requests, start_export
 
@@ -2434,8 +2437,7 @@ class SettingsDialog(QDialog):
         self._ai_full_data_bar.setValue(0)
         self._ai_full_data_bar.setVisible(True)
         self._full_data_message(
-            f"Building {len(requests)} request records — no model is being "
-            "run…"
+            f"Building {len(requests)} prompt logs — no model is being run…"
         )
         worker = ExportWorker(
             requests, root, self._ai_chat_log_dir.text().strip(),
@@ -2450,9 +2452,7 @@ class SettingsDialog(QDialog):
 
     def _full_data_progress(self, done: int, total: int) -> None:
         self._ai_full_data_bar.setValue(done)
-        self._full_data_message(
-            f"Writing {done} of {total} request records…"
-        )
+        self._full_data_message(f"Writing {done} of {total} prompt logs…")
 
     def _full_data_finished(self, result: dict) -> None:
         self._ai_full_data_worker = None
@@ -2470,12 +2470,12 @@ class SettingsDialog(QDialog):
         where = folder or "the export folder"
         if aborted:
             self._full_data_message(
-                f"Saved {saved} of the request records to {where}, then "
+                f"Saved {saved} of the prompt logs to {where}, then "
                 f"stopped: {aborted}",
                 warning=True,
             )
             return
-        text = f"Saved {saved} full-data files to {where}."
+        text = f"Saved {saved} prompt logs to {where}."
         if failed:
             text += (
                 f" {len(failed)} could not be built; the manifest lists "

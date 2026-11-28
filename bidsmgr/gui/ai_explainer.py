@@ -860,17 +860,23 @@ class AgentClient:
 
     # -- transport ---------------------------------------------------
 
-    def _request(
+    def _fetch(
         self,
         method: str,
         path: str,
         payload: Optional[dict] = None,
         *,
         timeout: Optional[float] = None,
-    ) -> dict:
+        accept: str = "application/json",
+    ) -> str:
+        """Send one request and return its body as text.
+
+        Keeping the transport separate lets the JSON endpoints parse and the
+        prompt-log endpoint hand its plain text straight to the exporter.
+        """
         url = f"{self.base_url}{path}"
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": accept}
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -881,7 +887,7 @@ class AgentClient:
             with urllib.request.urlopen(
                 req, timeout=timeout or self.timeout,
             ) as resp:
-                raw = resp.read().decode("utf-8", "replace")
+                return resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             raise AgentError(_http_error(url, exc), status=exc.code) from exc
         except urllib.error.URLError as exc:
@@ -892,8 +898,20 @@ class AgentClient:
             # when the read itself times out.
             raise AgentError(_timed_out(url, exc)) from exc
 
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[dict] = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> dict:
+        raw = self._fetch(
+            method, path, payload, timeout=timeout, accept="application/json",
+        )
         if not raw.strip():
             return {}
+        url = f"{self.base_url}{path}"
         try:
             out = json.loads(raw)
         except ValueError as exc:
@@ -907,6 +925,18 @@ class AgentClient:
                 f"{type(out).__name__}, expected an object."
             )
         return out
+
+    def _request_text(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[dict] = None,
+        *,
+        timeout: Optional[float] = None,
+    ) -> str:
+        return self._fetch(
+            method, path, payload, timeout=timeout, accept="text/plain",
+        )
 
     # -- endpoints ---------------------------------------------------
 
@@ -1045,6 +1075,27 @@ class AgentClient:
             )
         return out
 
+    @staticmethod
+    def _prompt_body(
+        user_input: str,
+        context: dict,
+        dataset_structure: Optional[str],
+        file_content: Optional[str],
+    ) -> dict:
+        """The body shared by ``/prompt`` and ``/prompt/log``."""
+        body: dict[str, Any] = {
+            "user_input": str(user_input),
+            "context": dict(context),
+        }
+        for key, value in (
+            ("dataset_structure", dataset_structure),
+            ("file_content", file_content),
+        ):
+            text = str(value or "").strip()
+            if text:
+                body[key] = text
+        return body
+
     def build_prompt(
         self,
         user_input: str,
@@ -1062,17 +1113,9 @@ class AgentClient:
         sends: a condensed dataset tree and a compiled file digest. Both
         are omitted when there is nothing to say.
         """
-        body: dict[str, Any] = {
-            "user_input": str(user_input),
-            "context": dict(context),
-        }
-        for key, value in (
-            ("dataset_structure", dataset_structure),
-            ("file_content", file_content),
-        ):
-            text = str(value or "").strip()
-            if text:
-                body[key] = text
+        body = self._prompt_body(
+            user_input, context, dataset_structure, file_content,
+        )
         try:
             out = self._request("POST", "/prompt", body)
         except AgentError as exc:
@@ -1087,6 +1130,35 @@ class AgentClient:
         out.setdefault("system_prompt", "")
         out.setdefault("user_prompt", str(user_input))
         return out
+
+    def build_prompt_log(
+        self,
+        user_input: str,
+        context: dict,
+        dataset_structure: Optional[str] = None,
+        file_content: Optional[str] = None,
+    ) -> str:
+        """``POST /prompt/log`` — one complete prompt as plain text.
+
+        The agent assembles the system message, runs retrieval and returns
+        the ``[System prompt]`` / ``[User prompt]`` log used for one
+        exported finding. No checkpoint is loaded and no answer is
+        generated.
+        """
+        body = self._prompt_body(
+            user_input, context, dataset_structure, file_content,
+        )
+        try:
+            return self._request_text("POST", "/prompt/log", body)
+        except AgentError as exc:
+            if getattr(exc, "status", None) == 404:
+                raise AgentError(
+                    "The AI agent does not support prompt-log export — it "
+                    "is an older version. Update the AI Agent module in "
+                    "Settings and try again.",
+                    status=404,
+                ) from exc
+            raise
 
 
 def llm_config_payload(settings: Any) -> dict:

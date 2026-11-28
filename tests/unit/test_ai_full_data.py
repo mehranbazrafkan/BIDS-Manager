@@ -61,7 +61,18 @@ def _report() -> ValidationReport:
     )
 
 
-def _build(calls: list, *, system: str = "SYSTEM") -> Callable[..., dict]:
+def _log(user_input: str, system: str = "SYSTEM") -> str:
+    return (
+        "[System prompt]\n"
+        "---------------\n"
+        f"{system}\n\n"
+        "[User prompt]\n"
+        "-------------\n"
+        f"{user_input}\n"
+    )
+
+
+def _build(calls: list, *, system: str = "SYSTEM") -> Callable[..., str]:
     def build(user_input, context, dataset_structure=None, file_content=None):
         calls.append({
             "user_input": user_input,
@@ -69,15 +80,7 @@ def _build(calls: list, *, system: str = "SYSTEM") -> Callable[..., dict]:
             "dataset_structure": dataset_structure,
             "file_content": file_content,
         })
-        return {
-            "system_prompt": system,
-            "user_prompt": user_input,
-            "intent": "explain",
-            "classification_source": "manual",
-            "prompt_available": True,
-            "retrieval_found": True,
-            "retrieval_quality": "partial",
-        }
+        return _log(user_input, system)
 
     return build
 
@@ -131,7 +134,7 @@ def test_each_export_gets_a_new_timestamped_folder(tmp_path):
     assert first != second
 
 
-def test_export_writes_one_record_per_finding_and_a_manifest(tmp_path):
+def test_export_writes_one_log_per_finding_and_a_manifest(tmp_path):
     report = _report()
     (tmp_path / "sub-01" / "anat").mkdir(parents=True)
     (tmp_path / "sub-01" / "anat" / "sub-01_T1w.json").write_text(
@@ -149,20 +152,20 @@ def test_export_writes_one_record_per_finding_and_a_manifest(tmp_path):
     assert result["aborted"] == ""
 
     folder = Path(result["folder"])
-    records = [
-        json.loads(p.read_text(encoding="utf-8"))
-        for p in folder.glob("*.json")
-        if p.name != "manifest.json"
-    ]
-    assert len(records) == 3
-    assert all(record["format"] == FORMAT for record in records)
-    assert all(record["output"] is None for record in records)
-    assert all("response" not in record for record in records)
-    assert all(record["system_prompt"] == "SYSTEM" for record in records)
+    logs = sorted(folder.glob("*.log"))
+    assert len(logs) == 3
+    texts = [p.read_text(encoding="utf-8") for p in logs]
+    assert all(text.startswith("[System prompt]\n") for text in texts)
+    assert all("[User prompt]\n-------------\n" in text for text in texts)
+    assert all("SYSTEM" in text for text in texts)
+    assert all("[Agent output]" not in text for text in texts)
+    # The only JSON is the manifest; each finding is a readable log.
+    assert [p.name for p in folder.glob("*.json")] == ["manifest.json"]
 
     manifest = json.loads(
         (folder / "manifest.json").read_text(encoding="utf-8")
     )
+    assert manifest["format"] == FORMAT
     assert manifest["findings"] == 3
     assert manifest["saved"] == 3
     assert manifest["dataset"] == str(tmp_path)
@@ -236,13 +239,7 @@ def test_an_unreachable_agent_keeps_what_was_written_and_stops(tmp_path):
         calls["count"] += 1
         if calls["count"] == 2:
             raise AgentError("The AI agent is not reachable.")
-        return {
-            "system_prompt": "SYSTEM",
-            "user_prompt": user_input,
-            "intent": "explain",
-            "classification_source": "manual",
-            "prompt_available": True,
-        }
+        return _log(user_input)
 
     result = export_records(
         collect_requests(_report()), tmp_path, str(tmp_path / "logs"), build,
@@ -251,7 +248,8 @@ def test_an_unreachable_agent_keeps_what_was_written_and_stops(tmp_path):
     assert result["saved"] == 1
     assert "not reachable" in result["aborted"]
     folder = Path(result["folder"])
-    assert len(list(folder.glob("*.json"))) == 2  # the record + the manifest
+    assert len(list(folder.glob("*.log"))) == 1
+    assert (folder / "manifest.json").is_file()
 
 
 def test_one_rejected_request_does_not_stop_the_rest(tmp_path):
@@ -261,13 +259,7 @@ def test_one_rejected_request_does_not_stop_the_rest(tmp_path):
         calls["count"] += 1
         if calls["count"] == 2:
             raise AgentError("500 from the retriever", status=500)
-        return {
-            "system_prompt": "SYSTEM",
-            "user_prompt": user_input,
-            "intent": "explain",
-            "classification_source": "manual",
-            "prompt_available": True,
-        }
+        return _log(user_input)
 
     result = export_records(
         collect_requests(_report()), tmp_path, str(tmp_path / "logs"), build,

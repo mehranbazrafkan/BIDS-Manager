@@ -62,6 +62,14 @@ class _StubAgent(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, text: str, status: int = 200) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:                       # noqa: N802
         if self.path == "/models":
             self._send({"models": ["stub-7b-instruct"]})
@@ -101,6 +109,17 @@ class _StubAgent(BaseHTTPRequestHandler):
                 "name": body.get("name"), "status": "downloading",
                 "downloaded_bytes": 0, "total_bytes": None, "error": "",
             })
+            return
+        if self.path == "/prompt/log":
+            self.server.received = body             # type: ignore[attr-defined]
+            self._send_text(
+                "[System prompt]\n"
+                "---------------\n"
+                "SYSTEM PROMPT\n\n"
+                "[User prompt]\n"
+                "-------------\n"
+                f"{body.get('user_input')}\n"
+            )
             return
         self.server.received = body                 # type: ignore[attr-defined]
         self._send({
@@ -605,6 +624,34 @@ class TestTransport:
                        dataset_structure="   ", file_content=None)
         assert "dataset_structure" not in server.received            # type: ignore[attr-defined]
         assert "file_content" not in server.received                 # type: ignore[attr-defined]
+
+    def test_prompt_log_is_plain_text_without_an_answer(self, stub_agent):
+        """The dataset export needs one readable file per finding, not JSON."""
+        client, server = stub_agent
+
+        text = client.build_prompt_log(
+            "Explain it", {"rule_id": "a.b"},
+            dataset_structure="my_dataset/\n└── participants.tsv",
+            file_content="TSV table: 3 columns",
+        )
+
+        assert text.startswith("[System prompt]\n")
+        assert "[User prompt]\n-------------\nExplain it\n" in text
+        assert "[Agent output]" not in text
+        sent = server.received                         # type: ignore[attr-defined]
+        assert sent["dataset_structure"].startswith("my_dataset/")
+        assert sent["file_content"] == "TSV table: 3 columns"
+
+    def test_an_agent_without_prompt_logs_is_reported_as_older(self):
+        """Do not make the user read a bare 404 when the agent is stale."""
+        client = AgentClient(base_url="http://127.0.0.1:1", timeout=0.2)
+
+        def missing(*args, **kwargs):
+            raise AgentError("missing", status=404)
+
+        client._request_text = missing  # type: ignore[method-assign]
+        with pytest.raises(AgentError, match="older version"):
+            client.build_prompt_log("Explain it", {"rule_id": "a.b"})
 
     def test_unreachable_service_says_where_to_start_it(self, dead_url):
         """Not "start it in a terminal": BIDS-Manager does that now."""
