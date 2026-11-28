@@ -463,6 +463,33 @@ class TestEvidenceFor:
         assert mod._evidence_for({"path": "sub-01/func/x.json"}, None) == ("", "")
         assert mod._evidence_for({}, None) == ("", "")
 
+    def test_the_two_evidence_switches_are_independent(self, tmp_path):
+        from bidsmgr.gui import ai_explainer as mod
+
+        paths = _dataset(tmp_path / "my_mri_dataset")
+        payload = {"path": "sub-01/ses-01/anat/sub-01_ses-01_T1w.json"}
+
+        structure, digest = mod._evidence_for(
+            payload, paths["root"], include_structure=False,
+            include_content=False,
+        )
+        assert structure == ""
+        assert digest == ""
+
+        structure, digest = mod._evidence_for(
+            payload, paths["root"], include_structure=True,
+            include_content=False,
+        )
+        assert structure.startswith("my_mri_dataset/")
+        assert digest == ""
+
+        structure, digest = mod._evidence_for(
+            payload, paths["root"], include_structure=False,
+            include_content=True,
+        )
+        assert structure == ""
+        assert "RepetitionTime: 2.0" in digest
+
 
 # =====================================================================
 # Transport
@@ -749,6 +776,9 @@ class TestPushingConfig:
         s.ai_quantization = "8bit"
         s.ai_enable_thinking = True
         s.ai_temperature = 0.4
+        s.ai_system_prompt = "Custom instructions."
+        s.ai_include_dataset_structure = False
+        s.ai_include_file_content = False
 
         assert llm_config_payload(s) == {
             "model_name": "google/gemma-3-4b-it",
@@ -757,6 +787,9 @@ class TestPushingConfig:
             "quantization": "8bit",
             "enable_thinking": True,
             "temperature": 0.4,
+            "system_prompt": "Custom instructions.",
+            "include_dataset_structure": False,
+            "include_file_content": False,
         }
 
     def test_an_unpicked_model_is_left_out_rather_than_sent_blank(self):
@@ -780,9 +813,15 @@ class TestPushingConfig:
 
         s = AppSettings()
         s.ai_quantization = "4bit"
+        s.ai_system_prompt = "Custom instructions."
+        s.ai_include_dataset_structure = False
+        s.ai_include_file_content = False
         assert mod.push_llm_config(s) is None
         assert server.config["quantization"] == "4bit"
         assert server.config["max_new_tokens"] == 250
+        assert server.config["system_prompt"] == "Custom instructions."
+        assert server.config["include_dataset_structure"] is False
+        assert server.config["include_file_content"] is False
 
     def test_a_dead_agent_is_quiet_not_an_error_dialog(
         self, monkeypatch, dead_url,

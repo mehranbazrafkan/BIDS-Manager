@@ -16,6 +16,7 @@ page lays the post-convert chain out as an indented hierarchy (parent step
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,8 @@ from PyQt6.QtCore import QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -41,6 +44,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -65,6 +69,99 @@ from .ai_install_panel import AiInstallPanel
 from .app_settings import AI_DEVICE_MAPS, AI_QUANTIZATIONS, AppSettings
 from .metadata_help import schema_summary
 from .typefaces import code
+
+
+class _ScrollSafeComboBox(QComboBox):
+    """A dropdown that does not change value when the page is scrolled.
+
+    Settings is a long form, and the wheel is how a user moves down it.
+    QComboBox otherwise treats a wheel event over the closed control as a
+    value change, so merely passing over a dropdown while scrolling picks
+    a different model, memory mode or device. Once the popup is open the
+    wheel belongs to the list again.
+
+    Used by the AI Agent page only; the other tabs keep their existing
+    behaviour.
+    """
+
+    def _scroll_area(self):
+        """The enclosing scrolling page, if this dropdown sits in one."""
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QAbstractScrollArea):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+
+        area = self._scroll_area()
+        if area is None:
+            event.ignore()
+            return
+
+        # Forward the wheel to the page ourselves instead of relying on
+        # Qt's ignored-event propagation. That keeps the page scrolling
+        # even when the closed combo has keyboard focus, and ``accept``
+        # prevents a second scroll from the propagated event.
+        bar = area.verticalScrollBar()
+        pixel = event.pixelDelta().y()
+        if pixel:
+            bar.setValue(bar.value() - pixel)
+        else:
+            angle = event.angleDelta().y()
+            if angle:
+                lines = QApplication.wheelScrollLines()
+                if lines < 0:
+                    lines = 3
+                if lines:
+                    bar.setValue(
+                        bar.value()
+                        - round(angle / 120.0 * lines * bar.singleStep())
+                    )
+        event.accept()
+
+
+def _installed_system_prompt() -> str:
+    """The built-in prompt shipped with the installed agent.
+
+    The Settings page shows the built-in wording rather than an empty box,
+    but it must not keep a second copy of that wording: a stale copy would
+    survive an agent update and quietly become the prompt. The installed
+    module is read without executing it, so this stays a plain source read.
+    """
+    path = agent_installer.install_dir() / "system_prompt.py"
+    try:
+        source = path.read_text(encoding="utf-8")
+        module = ast.parse(source, filename=str(path))
+    except (OSError, SyntaxError, ValueError):
+        return ""
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if value is None:
+            continue
+        if not any(
+            isinstance(target, ast.Name)
+            and target.id == "BIDS_SYSTEM_PROMPT"
+            for target in targets
+        ):
+            continue
+        try:
+            text = ast.literal_eval(value)
+        except (TypeError, ValueError, SyntaxError):
+            return ""
+        return text.strip() if isinstance(text, str) else ""
+    return ""
 
 
 def _indented(child: QWidget, *, indent: int = 22) -> QWidget:
@@ -1671,7 +1768,7 @@ class SettingsDialog(QDialog):
         # -- which model ----------------------------------------------
         model_row = QHBoxLayout()
         model_row.setSpacing(8)
-        self._ai_model = QComboBox()
+        self._ai_model = _ScrollSafeComboBox()
         self._ai_model.setEditable(False)
         # The rows are names only: a description, a parameter count and a
         # VRAM figure on one line made the list unreadable (and wider
@@ -1688,6 +1785,12 @@ class SettingsDialog(QDialog):
         self._ai_model.setPlaceholderText(
             "No models yet — start the agent to list them"
         )
+        # ``activated`` is the user choosing a row, not the programmatic
+        # selection done when the agent's current model is read back. The
+        # distinction matters on Save: an untouched dropdown must not turn
+        # the agent's own model into this app's stored choice.
+        self._ai_model_picked = False
+        self._ai_model.activated.connect(self._on_ai_model_picked)
         self._ai_model.currentIndexChanged.connect(self._show_model_tooltip)
         model_row.addWidget(self._ai_model, 1)
         self._ai_download_btn = QPushButton("Download")
@@ -1795,6 +1898,70 @@ class SettingsDialog(QDialog):
         chat_log_row.addWidget(chat_log_open_btn, 0)
         form.addRow("Chat logs saved in:", chat_log_row)
 
+        # -- what every request says before the finding ----------------
+        # The box shows the prompt in force, including the built-in wording;
+        # an empty box is not a useful answer to "what does the agent see?".
+        # Saving the text unchanged still leaves the stored override empty,
+        # so a future built-in wording can reach users who did not edit it.
+        prompt_row = QVBoxLayout()
+        prompt_row.setSpacing(4)
+        self._ai_system_prompt = QPlainTextEdit()
+        self._ai_system_prompt.setMinimumHeight(130)
+        self._ai_system_prompt.setPlaceholderText(
+            "The built-in prompt is not available. Start or update the AI "
+            "agent to load it."
+        )
+        self._ai_system_prompt.setToolTip(
+            "The instructions the agent follows for every question in this "
+            "project.\n\n"
+            "The built-in BIDS prompt is shown here. Edit it and save to use "
+            "your own wording; the agent receives it on the next question. "
+            "If you leave the built-in text unchanged, the agent keeps using "
+            "its built-in prompt, so later updates still apply.\n\n"
+            "This controls the agent's role and rules. The finding, the "
+            "file evidence and the dataset structure are added separately "
+            "for each request."
+        )
+        self._ai_system_prompt_builtin = ""
+        reset_prompt_btn = QPushButton("Reset to built-in")
+        reset_prompt_btn.setToolTip(
+            "Replace the editor contents with the latest built-in BIDS "
+            "instructions."
+        )
+        reset_prompt_btn.clicked.connect(self._reset_ai_system_prompt)
+        prompt_actions = QHBoxLayout()
+        prompt_actions.addStretch(1)
+        prompt_actions.addWidget(reset_prompt_btn, 0)
+        prompt_row.addWidget(self._ai_system_prompt)
+        prompt_row.addLayout(prompt_actions)
+        form.addRow("System prompt:", prompt_row)
+
+        self._ai_dataset_structure = QCheckBox(
+            "Send the dataset structure (condensed tree) to the agent"
+        )
+        self._ai_dataset_structure.setToolTip(
+            "Adds a condensed tree of the project to the agent's evidence: "
+            "folders, subjects, sessions and files around the finding.\n\n"
+            "It helps with path, naming and “where does this belong?” "
+            "questions. Uncheck it to save prompt space and make answers "
+            "faster when the project layout is not relevant. The separate "
+            "file-content switch below controls the finding's own digest."
+        )
+        form.addRow("", self._ai_dataset_structure)
+
+        self._ai_file_content = QCheckBox(
+            "Send the file content (compiled digest) to the agent"
+        )
+        self._ai_file_content.setToolTip(
+            "Adds the “[File Content — compiled digest]” section: what is "
+            "in the file the finding is on, compiled rather than copied "
+            "whole (format, keys or columns, representative values).\n\n"
+            "It grounds answers about file contents. Uncheck it to save "
+            "prompt space when the finding and the dataset layout are "
+            "enough."
+        )
+        form.addRow("", self._ai_file_content)
+
         # -- the request side of every finding --------------------------
         # One click writes what a question would send for every error and
         # warning, without generating: the files are a dataset for review
@@ -1862,7 +2029,7 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Answer length:", self._ai_tokens)
 
-        self._ai_quant = QComboBox()
+        self._ai_quant = _ScrollSafeComboBox()
         for value in AI_QUANTIZATIONS:
             self._ai_quant.addItem(_QUANT_LABELS[value], value)
         self._ai_quant.setToolTip(
@@ -1882,7 +2049,7 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Memory:", self._ai_quant)
 
-        self._ai_device = QComboBox()
+        self._ai_device = _ScrollSafeComboBox()
         for value in AI_DEVICE_MAPS:
             self._ai_device.addItem(_DEVICE_LABELS[value], value)
         self._ai_device.setToolTip(
@@ -2146,6 +2313,9 @@ class SettingsDialog(QDialog):
         self._ai_install_panel.hide()
         self._ai_box.show()
         self._ai_note.show()
+        self._ai_system_prompt_builtin = _installed_system_prompt()
+        if not self._ai_system_prompt.toPlainText().strip():
+            self._reset_ai_system_prompt()
         self._ai_python.setText(python)
         # Only the interpreter is written: the rest of the page has not
         # been saved yet, and a full save here would persist the copy
@@ -2269,6 +2439,10 @@ class SettingsDialog(QDialog):
         )
         worker = ExportWorker(
             requests, root, self._ai_chat_log_dir.text().strip(),
+            include_dataset_structure=(
+                self._ai_dataset_structure.isChecked()
+            ),
+            include_file_content=self._ai_file_content.isChecked(),
         )
         worker.progress.connect(self._full_data_progress)
         worker.finished_with.connect(self._full_data_finished)
@@ -2554,6 +2728,7 @@ class SettingsDialog(QDialog):
             self._sync_agent_knobs(llm)
 
         chosen = self._ai_model.currentData() or ""
+        listed = {str(entry["name"]) for entry in models}
         self._ai_model.clear()
         for entry in models:
             name = str(entry["name"])
@@ -2570,7 +2745,13 @@ class SettingsDialog(QDialog):
             if not models else
             "No models yet — start the agent to list them"
         )
-        self._set_agent_model(chosen or current)
+        # The old dropdown may have been filled from disk while the agent
+        # was down. A model that is not in the agent's catalogue is not the
+        # one it is running, so prefer the agent's current model; a real
+        # custom choice survives only when the agent has no current model.
+        self._set_agent_model(
+            chosen if chosen in listed else (current or chosen)
+        )
 
         ready_count = sum(1 for m in models if str(m["name"]) in downloaded)
         unfinished = [n for n in partial_on_disk if n not in downloaded]
@@ -2758,6 +2939,18 @@ class SettingsDialog(QDialog):
             )
         self._ai_model.setToolTip(tip or self._ai_model_hint)
 
+    def _on_ai_model_picked(self, _index: int) -> None:
+        """Remember that the model choice came from the user."""
+        self._ai_model_picked = True
+
+    def _reset_ai_system_prompt(self) -> None:
+        """Put the latest built-in prompt back in the editor."""
+        latest = _installed_system_prompt()
+        if latest:
+            self._ai_system_prompt_builtin = latest
+        self._ai_system_prompt.setPlainText(self._ai_system_prompt_builtin)
+        self._ai_system_prompt.document().setModified(False)
+
     def _set_agent_model(self, name: str) -> None:
         """Select ``name``, adding it if the agent's list omits it."""
         name = (name or "").strip()
@@ -2902,6 +3095,7 @@ class SettingsDialog(QDialog):
         self._ai_timeout.setValue(max(5, int(s.ai_timeout)))
         self._ai_python.setText(s.ai_python)
         self._set_agent_model(s.ai_model)
+        self._ai_model_picked = False
         # The boxes show the folder in force, not an empty box with the
         # answer in a placeholder: "where do the models go?" is answered
         # without hovering, and clearing a box puts the default back.
@@ -2922,6 +3116,16 @@ class SettingsDialog(QDialog):
         )
         self._ai_think.setChecked(s.ai_enable_thinking)
         self._ai_temperature.setValue(float(s.ai_temperature))
+        stored_prompt = str(s.ai_system_prompt or "").strip()
+        self._ai_system_prompt_builtin = _installed_system_prompt()
+        self._ai_system_prompt.setPlainText(
+            stored_prompt or self._ai_system_prompt_builtin
+        )
+        self._ai_system_prompt.document().setModified(False)
+        self._ai_dataset_structure.setChecked(
+            bool(s.ai_include_dataset_structure)
+        )
+        self._ai_file_content.setChecked(bool(s.ai_include_file_content))
         self._ai_test_result.setText("")
         self._ai_test_result.setStyleSheet("color: #8b949e;")
         self._ai_test_result.setToolTip("")
@@ -3057,7 +3261,8 @@ class SettingsDialog(QDialog):
         # agent itself, so the only address worth trusting is the one it
         # just bound, and a saved URL is a stale one by construction.
         s.ai_python = self._ai_python.text().strip()
-        s.ai_model = (self._ai_model.currentData() or "").strip()
+        if self._ai_model_picked:
+            s.ai_model = (self._ai_model.currentData() or "").strip()
         s.ai_models_dir = self._stored_folder(
             self._ai_models_dir, agent_service.models_dir(""),
         )
@@ -3069,6 +3274,16 @@ class SettingsDialog(QDialog):
         s.ai_quantization = self._ai_quant.currentData() or "none"
         s.ai_enable_thinking = self._ai_think.isChecked()
         s.ai_temperature = float(self._ai_temperature.value())
+        # Empty is meaningful: it selects the agent's built-in prompt. Leaving
+        # the built-in text untouched must therefore store empty, or simply
+        # opening Settings would pin a copy and stop future wording updates.
+        prompt_text = self._ai_system_prompt.toPlainText().strip()
+        builtin_text = self._ai_system_prompt_builtin.strip()
+        s.ai_system_prompt = "" if prompt_text == builtin_text else prompt_text
+        s.ai_include_dataset_structure = (
+            self._ai_dataset_structure.isChecked()
+        )
+        s.ai_include_file_content = self._ai_file_content.isChecked()
 
         s.save()
         self._save_viewer_settings()

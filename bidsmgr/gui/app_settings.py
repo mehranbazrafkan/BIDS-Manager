@@ -140,6 +140,9 @@ KEYS = {
     "ai_quantization":  "ai/quantization",   # none | 4bit | 8bit
     "ai_enable_thinking": "ai/enable_thinking",
     "ai_temperature":   "ai/temperature",    # answer variety
+    "ai_system_prompt": "ai/system_prompt",  # "" = built-in prompt
+    "ai_include_dataset_structure": "ai/include_dataset_structure",
+    "ai_include_file_content": "ai/include_file_content",
 }
 
 # Permitted values for the agent's LLM knobs, shared by the loader (which
@@ -396,6 +399,16 @@ class AppSettings:
     ai_quantization: str = "none"      # none | 4bit | 8bit
     ai_enable_thinking: bool = False
     ai_temperature: float = 0.75       # answer variety, not "creativity"
+    # Custom system instructions pushed to the agent. Empty means the
+    # agent's built-in BIDS prompt, so updating that default stays
+    # possible for anyone who has not deliberately written a replacement.
+    ai_system_prompt: str = ""
+    # Whether the condensed project tree travels with a finding. It helps
+    # path/folder questions but costs prompt tokens, so it is a switch.
+    ai_include_dataset_structure: bool = True
+    # Whether the finding's compiled file digest travels as evidence. It
+    # grounds questions about file contents, but is not always needed.
+    ai_include_file_content: bool = True
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -738,6 +751,17 @@ class AppSettings:
         )
         if not 0.0 <= out.ai_temperature <= 2.0:
             out.ai_temperature = 0.75
+        out.ai_system_prompt = _as_str(
+            s.value(KEYS["ai_system_prompt"]), out.ai_system_prompt,
+        )
+        out.ai_include_dataset_structure = _as_bool(
+            s.value(KEYS["ai_include_dataset_structure"]),
+            out.ai_include_dataset_structure,
+        )
+        out.ai_include_file_content = _as_bool(
+            s.value(KEYS["ai_include_file_content"]),
+            out.ai_include_file_content,
+        )
         return out
 
     def placeholder_scope(self) -> str:
@@ -813,6 +837,10 @@ class AppSettings:
             ("ask_for_star",             self.ask_for_star),
             ("ai_enabled",               self.ai_enabled),
             ("ai_enable_thinking",       self.ai_enable_thinking),
+            ("ai_include_dataset_structure",
+             self.ai_include_dataset_structure),
+            ("ai_include_file_content",
+             self.ai_include_file_content),
         ):
             s.setValue(KEYS[key], "1" if val else "0")
         # Strings. Keep them OUT of the loop above: it writes "1" for anything
@@ -854,6 +882,7 @@ class AppSettings:
         s.setValue(KEYS["ai_quantization"], self.ai_quantization)
         s.setValue(KEYS["ai_max_new_tokens"], int(self.ai_max_new_tokens))
         s.setValue(KEYS["ai_temperature"], float(self.ai_temperature))
+        s.setValue(KEYS["ai_system_prompt"], self.ai_system_prompt)
         # Scan rules as JSON blobs.
         s.setValue(KEYS["user_hints"], json.dumps(self.user_hints))
         s.setValue(KEYS["scan_exclusions"], json.dumps(self.scan_exclusions))

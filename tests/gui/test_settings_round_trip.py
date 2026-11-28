@@ -104,6 +104,7 @@ def test_every_string_setting_round_trips_a_non_boolish_value():
         "icon_style": "accent",
         # Vocabularies app_settings validates against on load; anything
         # outside them is reset to the default by design.
+        "ai_base_url": "http://127.0.0.1:9000",
         "ai_device_map": "cpu",
         "ai_quantization": "4bit",
         "editor_field_scope": "present",

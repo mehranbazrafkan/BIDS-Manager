@@ -244,9 +244,21 @@ def dead_url() -> str:
 @pytest.fixture(autouse=True)
 def agent_enabled():
     """Every test here starts from the shipped default: the button is on."""
-    _set(ai_enabled=True, ai_base_url="http://127.0.0.1:8000", ai_timeout=30)
+    _set(
+        ai_enabled=True,
+        ai_base_url="http://127.0.0.1:8000",
+        ai_timeout=30,
+        ai_include_dataset_structure=True,
+        ai_include_file_content=True,
+    )
     yield
-    _set(ai_enabled=True, ai_base_url="http://127.0.0.1:8000", ai_timeout=120)
+    _set(
+        ai_enabled=True,
+        ai_base_url="http://127.0.0.1:8000",
+        ai_timeout=120,
+        ai_include_dataset_structure=True,
+        ai_include_file_content=True,
+    )
 
 
 # =====================================================================
@@ -385,6 +397,63 @@ class TestWhatGetsSent:
         assert "RepetitionTime: 2.0" in sent["file_content"]
         assert str(tmp_path) not in sent["dataset_structure"]
         assert str(tmp_path) not in sent["file_content"]
+
+    def test_the_dataset_tree_can_be_turned_off(
+        self, qtbot, stub_agent, tmp_path,
+    ):
+        """The Settings checkbox drops the tree, not the finding's own file.
+
+        Walking a large dataset is wasted work when the project layout is
+        not what the question is about, so the switch skips it entirely.
+        """
+        _set(
+            ai_base_url=stub_agent.url,
+            ai_include_dataset_structure=False,
+        )
+        root = _dataset(tmp_path / "my_mri_dataset")
+        payload = build_payload(
+            severity="err",
+            message="RepetitionTime is required.",
+            rule_id="evidence.test.no_tree",
+            extra={"path": "sub-01/func/sub-01_task-rest_bold.json"},
+        )
+
+        dialog = AiExplainDialog(payload, root=root)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received                       # type: ignore[attr-defined]
+        assert "dataset_structure" not in sent
+        assert "RepetitionTime: 2.0" in sent["file_content"]
+
+    def test_the_file_content_can_be_turned_off(
+        self, qtbot, stub_agent, tmp_path,
+    ):
+        """The two evidence checkboxes are independent: dropping the file
+        digest keeps the dataset tree, and vice versa."""
+        _set(
+            ai_base_url=stub_agent.url,
+            ai_include_file_content=False,
+        )
+        root = _dataset(tmp_path / "my_mri_dataset")
+        payload = build_payload(
+            severity="err",
+            message="RepetitionTime is required.",
+            rule_id="evidence.test.no_file_content",
+            extra={"path": "sub-01/func/sub-01_task-rest_bold.json"},
+        )
+
+        dialog = AiExplainDialog(payload, root=root)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        dialog.start()
+        qtbot.waitUntil(lambda: not dialog.is_busy(), timeout=10_000)
+
+        sent = stub_agent.received                       # type: ignore[attr-defined]
+        assert "file_content" not in sent
+        assert "dataset_structure" in sent
 
     def test_no_dataset_means_no_evidence_fields(self, qtbot, stub_agent):
         """A finding with nothing behind it — no path, no root — must
@@ -1291,6 +1360,9 @@ class TestSettings:
         s.ai_quantization = "4bit"
         s.ai_enable_thinking = True
         s.ai_temperature = 0.35
+        s.ai_system_prompt = "Custom instructions."
+        s.ai_include_dataset_structure = False
+        s.ai_include_file_content = False
         dialog = SettingsDialog(s)
         qtbot.addWidget(dialog)
 
@@ -1302,9 +1374,118 @@ class TestSettings:
         assert dialog._ai_quant.currentData() == "4bit"
         assert dialog._ai_think.isChecked()
         assert dialog._ai_temperature.value() == pytest.approx(0.35)
+        assert dialog._ai_system_prompt.toPlainText() == "Custom instructions."
+        assert not dialog._ai_dataset_structure.isChecked()
+        assert not dialog._ai_file_content.isChecked()
         # There is deliberately no URL field: the process that starts the
         # service already knows where it is.
         assert not hasattr(dialog, "_ai_url")
+
+    def test_the_wheel_scrolls_the_page_instead_of_changing_a_dropdown(
+        self, qtbot,
+    ):
+        """Hovering an AI dropdown and scrolling must not pick a value."""
+        from PyQt6.QtCore import QPoint, QPointF
+        from PyQt6.QtGui import QWheelEvent
+        from PyQt6.QtWidgets import QApplication, QScrollArea
+
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._ai_model.clear()
+        dialog._ai_model.addItems(["first", "second"])
+        dialog._ai_model.setCurrentIndex(0)
+
+        for combo in (
+            dialog._ai_model, dialog._ai_quant, dialog._ai_device,
+        ):
+            combo.setCurrentIndex(0)
+            before = combo.currentIndex()
+            event = QWheelEvent(
+                QPointF(combo.rect().center()),
+                QPointF(combo.mapToGlobal(combo.rect().center())),
+                QPoint(0, 0),
+                QPoint(0, -120),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            QApplication.sendEvent(combo, event)
+            assert combo.currentIndex() == before
+
+        # The event is not merely swallowed: the page underneath moves.
+        combo = dialog._ai_quant
+        parent = combo.parentWidget()
+        while parent is not None and not isinstance(parent, QScrollArea):
+            parent = parent.parentWidget()
+        assert parent is not None
+        bar = parent.verticalScrollBar()
+        bar.setValue(0)
+        event = QWheelEvent(
+            QPointF(combo.rect().center()),
+            QPointF(combo.mapToGlobal(combo.rect().center())),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        QApplication.sendEvent(combo, event)
+        assert bar.value() > 0
+
+    def test_the_latest_builtin_prompt_is_shown(self, qtbot, monkeypatch):
+        """The box answers "what does the agent see?" without a click."""
+        from bidsmgr.gui import settings_dialog
+
+        monkeypatch.setattr(
+            settings_dialog, "_installed_system_prompt",
+            lambda: "BUILT-IN PROMPT",
+        )
+        dialog = settings_dialog.SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        assert dialog._ai_system_prompt_builtin == "BUILT-IN PROMPT"
+        assert dialog._ai_system_prompt.toPlainText() == "BUILT-IN PROMPT"
+
+        dialog._ai_system_prompt.setPlainText("Edited prompt.")
+        dialog._reset_ai_system_prompt()
+        assert dialog._ai_system_prompt.toPlainText() == "BUILT-IN PROMPT"
+
+    def test_an_untouched_builtin_prompt_is_not_stored_as_an_override(
+        self, qtbot, monkeypatch,
+    ):
+        """Showing the built-in text must not pin a copy of it on Save."""
+        from bidsmgr.gui import settings_dialog
+
+        monkeypatch.setattr(
+            settings_dialog, "_installed_system_prompt",
+            lambda: "BUILT-IN PROMPT",
+        )
+        dialog = settings_dialog.SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+
+        dialog._on_save()
+
+        assert AppSettings.load().ai_system_prompt == ""
+
+    def test_the_builtin_prompt_is_read_from_the_installed_agent(
+        self, tmp_path, monkeypatch,
+    ):
+        from bidsmgr.gui import settings_dialog
+
+        (tmp_path / "system_prompt.py").write_text(
+            'BIDS_SYSTEM_PROMPT = """\\nRead from disk.\\n"""\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            settings_dialog.agent_installer, "install_dir", lambda: tmp_path,
+        )
+
+        assert settings_dialog._installed_system_prompt() == "Read from disk."
 
     def test_saving_writes_the_model_knobs_back(self, qtbot):
         from bidsmgr.gui.settings_dialog import SettingsDialog
@@ -1322,6 +1503,9 @@ class TestSettings:
         )
         dialog._ai_think.setChecked(True)
         dialog._ai_temperature.setValue(1.25)
+        dialog._ai_system_prompt.setPlainText("Custom instructions.")
+        dialog._ai_dataset_structure.setChecked(False)
+        dialog._ai_file_content.setChecked(False)
 
         dialog._on_save()
 
@@ -1332,6 +1516,25 @@ class TestSettings:
         assert after.ai_quantization == "8bit"
         assert after.ai_enable_thinking is True
         assert after.ai_temperature == pytest.approx(1.25)
+        assert after.ai_system_prompt == "Custom instructions."
+        assert after.ai_include_dataset_structure is False
+        assert after.ai_include_file_content is False
+
+    def test_a_model_the_user_picks_is_saved(self, qtbot):
+        """The read-back selection is not a choice; an activated row is."""
+        from bidsmgr.gui.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog(AppSettings())
+        qtbot.addWidget(dialog)
+        dialog._ai_model.addItem("picked-model", "picked-model")
+        dialog._ai_model.setCurrentIndex(
+            dialog._ai_model.findData("picked-model")
+        )
+        dialog._on_ai_model_picked(0)
+
+        dialog._on_save()
+
+        assert AppSettings.load().ai_model == "picked-model"
 
     def test_both_folders_are_shown_and_saved(self, qtbot, tmp_path):
         """Where models land and where conversations are written — the

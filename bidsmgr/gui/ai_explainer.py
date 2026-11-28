@@ -204,6 +204,35 @@ def ai_enabled() -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
+def include_dataset_structure() -> bool:
+    """Whether the condensed project tree travels with a finding.
+
+    The setting is read at request time rather than cached on the dialog, so
+    changing the checkbox in Settings applies to the next answer in a window
+    that is already open.
+    """
+    raw = _read("ai_include_dataset_structure", "1")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def include_file_content() -> bool:
+    """Whether the finding's compiled file digest travels with a question.
+
+    Like :func:`include_dataset_structure`, this is read at request time so
+    a Settings change applies to the next answer without reopening the chat.
+    """
+    raw = _read("ai_include_file_content", "1")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def agent_base_url() -> str:
     """Where the agent is.
 
@@ -730,7 +759,13 @@ def _human(size: int) -> str:
     return f"{size} B"
 
 
-def _evidence_for(payload: dict, root: Any = None) -> tuple[str, str]:
+def _evidence_for(
+    payload: dict,
+    root: Any = None,
+    *,
+    include_structure: bool = True,
+    include_content: bool = True,
+) -> tuple[str, str]:
     """The dataset tree and the file digest for *payload*.
 
     The root comes from whoever opened the window when they know one —
@@ -739,6 +774,11 @@ def _evidence_for(payload: dict, root: Any = None) -> tuple[str, str]:
     :func:`bidsmgr.viz.bids.dataset_root`. A *relative* path with no
     root beside it cannot be resolved to a file on disk, and guessing
     at one would read the wrong file, so that case sends neither.
+
+    ``include_structure`` and ``include_content`` are the two Settings
+    switches. They are independent because the tree describes the project
+    while the digest describes the finding's own file; either can be turned
+    off without disabling the other.
 
     Nothing absolute leaves this function: the tree is drawn from the
     root down, so the prompt learns the dataset's *shape* and never the
@@ -768,15 +808,19 @@ def _evidence_for(payload: dict, root: Any = None) -> tuple[str, str]:
     if base is None:
         return "", ""
 
-    focus = ""
-    if target is not None:
-        try:
-            focus = target.resolve().relative_to(base.resolve()).as_posix()
-        except (OSError, ValueError):
-            # Not under the root we were handed: draw the dataset we were
-            # given without pointing at a folder it does not contain.
-            focus = ""
-    return dataset_tree(base, focus=focus), file_digest(target)
+    tree = ""
+    if include_structure:
+        focus = ""
+        if target is not None:
+            try:
+                focus = target.resolve().relative_to(base.resolve()).as_posix()
+            except (OSError, ValueError):
+                # Not under the root we were handed: draw the dataset we were
+                # given without pointing at a folder it does not contain.
+                focus = ""
+        tree = dataset_tree(base, focus=focus)
+    digest = file_digest(target) if include_content else ""
+    return tree, digest
 
 
 # =====================================================================
@@ -1046,11 +1090,14 @@ class AgentClient:
 
 
 def llm_config_payload(settings: Any) -> dict:
-    """The ``PUT /config`` body built from stored LLM preferences.
+    """The ``PUT /config`` body built from stored AI preferences.
 
     An empty ``ai_model`` means "leave the agent's own config.json choice
     alone", so ``model_name`` is omitted rather than sent blank — a blank
     would travel all the way to ``from_pretrained``.
+
+    An empty system prompt is sent deliberately: it tells the agent to use
+    its built-in prompt, which is also how the field's placeholder reads.
     """
     payload: dict[str, Any] = {
         "max_new_tokens": int(settings.ai_max_new_tokens),
@@ -1058,6 +1105,15 @@ def llm_config_payload(settings: Any) -> dict:
         "enable_thinking": bool(settings.ai_enable_thinking),
         "quantization": str(settings.ai_quantization),
         "device_map": str(settings.ai_device_map),
+        "system_prompt": str(
+            getattr(settings, "ai_system_prompt", "") or ""
+        ).strip(),
+        "include_dataset_structure": bool(
+            getattr(settings, "ai_include_dataset_structure", True)
+        ),
+        "include_file_content": bool(
+            getattr(settings, "ai_include_file_content", True)
+        ),
     }
     model = str(getattr(settings, "ai_model", "") or "").strip()
     if model:
@@ -1544,11 +1600,15 @@ class TranscriptView(QScrollArea):
             item = self._lay.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                # Hide before deleting: a widget with its parent cleared
-                # becomes a top-level window for one event loop turn, and
-                # a redraw must not flash little windows. ``deleteLater``
-                # tears it down once the loop is free.
+                # Hide before unparenting: a widget with its parent
+                # cleared becomes a top-level window for one event loop
+                # turn, and a redraw must not flash little windows.
+                # Unparenting now also keeps the old buttons out of
+                # ``findChildren`` until ``deleteLater`` gets its turn;
+                # otherwise repeated redraws accumulate invisible
+                # children.
                 widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
         self._bubbles.clear()
         self._plain.clear()
@@ -1742,8 +1802,11 @@ class AiExplainDialog(QDialog):
         self._root = Path(root) if root else None
         # Built on the first ask and remembered: a directory walk and a
         # file read are not free, and a restored conversation never
-        # asks again at all.
+        # asks again at all. The include flag travels with the cache so
+        # changing Settings takes effect on the next question, not only
+        # in a newly opened window.
         self._evidence: Optional[tuple[str, str]] = None
+        self._evidence_switches: Optional[tuple[bool, bool]] = None
         # A flag, not the thread. Holding the QThread here is what makes
         # "user closes the dialog while the model is answering" unsafe.
         self._busy = False
@@ -2036,10 +2099,19 @@ class AiExplainDialog(QDialog):
 
         Both are evidence about the *dataset*, not about this question,
         so they are computed once and reused by every follow-up: the
-        folder does not move between one question and the next.
+        folder does not move between one question and the next. The two
+        Settings switches are part of the cache key because either can be
+        changed while the chat is open.
         """
-        if self._evidence is None:
-            self._evidence = _evidence_for(self._payload, self._root)
+        wanted = (include_dataset_structure(), include_file_content())
+        if self._evidence is None or self._evidence_switches != wanted:
+            self._evidence = _evidence_for(
+                self._payload,
+                self._root,
+                include_structure=wanted[0],
+                include_content=wanted[1],
+            )
+            self._evidence_switches = wanted
         return self._evidence
 
     def _repeat_of(self, prompt: str) -> Optional[int]:
@@ -2660,5 +2732,7 @@ __all__ = [
     "default_prompt",
     "file_digest",
     "hardware_text",
+    "include_dataset_structure",
+    "include_file_content",
     "plain_text",
 ]

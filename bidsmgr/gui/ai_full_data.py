@@ -3,8 +3,8 @@
 Settings → AI Agent offers one button that writes the "full data" of every
 error and warning in the current validation report: the system prompt the
 agent would send (instructions, retrieved BIDS knowledge, issue context,
-dataset structure, file digest), the user prompt, and how the request was
-routed — with no answer generated and no model loaded.
+and the optional dataset structure and file digest), the user prompt, and
+how the request was routed — with no answer generated and no model loaded.
 
 The point is a dataset, not a conversation. Each record is the input half
 of a fine-tuning pair (``output`` is deliberately ``null``), and the
@@ -133,6 +133,8 @@ def export_records(
     folder: str | Path,
     build: Callable[..., dict],
     *,
+    include_dataset_structure: bool = True,
+    include_file_content: bool = True,
     on_progress: Optional[Callable[[int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -142,7 +144,9 @@ def export_records(
     function in tests: naming, evidence and writing do not need a server.
     The dataset tree and the file digest are compiled here and cached per
     folder/file, because a report can hold thousands of findings over the
-    same handful of paths.
+    same handful of paths. ``include_dataset_structure`` and
+    ``include_file_content`` follow the Settings checkboxes: an unchecked
+    section is neither walked/read nor written into the prompt record.
 
     An agent that cannot be reached aborts the run after what was already
     written; a single request the agent rejects is recorded as a failure
@@ -172,12 +176,18 @@ def export_records(
         try:
             focus = request.focus
             if focus not in trees:
-                trees[focus] = dataset_tree(root_path, focus=focus)
+                trees[focus] = (
+                    dataset_tree(root_path, focus=focus)
+                    if include_dataset_structure else ""
+                )
             built = build(
                 request.prompt,
                 request.payload,
                 dataset_structure=trees[focus],
-                file_content=_digest_for(request, root_path, digests),
+                file_content=(
+                    _digest_for(request, root_path, digests)
+                    if include_file_content else ""
+                ),
             )
             record = _record(request, built)
             target = run_dir / f"{file_stem(request.key)}.json"
@@ -226,11 +236,16 @@ class ExportWorker(QThread):
         root: str | Path,
         folder: str | Path,
         parent=None,
+        *,
+        include_dataset_structure: bool = True,
+        include_file_content: bool = True,
     ) -> None:
         super().__init__(parent)
         self._requests = requests
         self._root = root
         self._folder = folder
+        self._include_dataset_structure = include_dataset_structure
+        self._include_file_content = include_file_content
         self._stop = False
 
     def stop(self) -> None:
@@ -245,6 +260,8 @@ class ExportWorker(QThread):
                 self._root,
                 self._folder,
                 client.build_prompt,
+                include_dataset_structure=self._include_dataset_structure,
+                include_file_content=self._include_file_content,
                 on_progress=self.progress.emit,
                 should_stop=lambda: self._stop,
             )

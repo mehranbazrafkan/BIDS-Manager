@@ -189,6 +189,46 @@ def test_the_file_finding_gets_the_file_digest(tmp_path):
     assert "sub-01" in file_call["dataset_structure"]
 
 
+def test_the_dataset_tree_can_be_left_out_of_the_export(tmp_path):
+    report = _report()
+    (tmp_path / "sub-01" / "anat").mkdir(parents=True)
+    (tmp_path / "sub-01" / "anat" / "sub-01_T1w.json").write_text(
+        '{"RepetitionTime": 2.0}', encoding="utf-8",
+    )
+    calls: list = []
+
+    export_records(
+        collect_requests(report), tmp_path, str(tmp_path / "logs"),
+        _build(calls), include_dataset_structure=False,
+    )
+
+    assert all(call["dataset_structure"] == "" for call in calls)
+    by_path = {call["context"].get("path"): call for call in calls}
+    assert "RepetitionTime" in (
+        by_path["sub-01/anat/sub-01_T1w.json"]["file_content"]
+    )
+
+
+def test_the_file_digest_can_be_left_out_of_the_export(tmp_path):
+    report = _report()
+    (tmp_path / "sub-01" / "anat").mkdir(parents=True)
+    (tmp_path / "sub-01" / "anat" / "sub-01_T1w.json").write_text(
+        '{"RepetitionTime": 2.0}', encoding="utf-8",
+    )
+    calls: list = []
+
+    export_records(
+        collect_requests(report), tmp_path, str(tmp_path / "logs"),
+        _build(calls), include_file_content=False,
+    )
+
+    assert all(call["file_content"] == "" for call in calls)
+    by_path = {call["context"].get("path"): call for call in calls}
+    assert "sub-01" in (
+        by_path["sub-01/anat/sub-01_T1w.json"]["dataset_structure"]
+    )
+
+
 def test_an_unreachable_agent_keeps_what_was_written_and_stops(tmp_path):
     calls = {"count": 0}
 
